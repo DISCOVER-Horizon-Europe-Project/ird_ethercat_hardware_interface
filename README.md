@@ -107,6 +107,27 @@ Each joint must declare one `velocity` command interface and the `position` and 
 state interfaces, in that order. Commands and states are in rad/s and rad at the joint, after
 the gearbox. The position is integrated from the measured velocity.
 
+## Code structure
+
+| File | Contents |
+|---|---|
+| `config.hpp/.cpp` | Configuration structures (bus, fault handling, drives), defaults and validation |
+| `pdo.hpp/.cpp` | PDO layout (offset of each mapped object) and little-endian encoding |
+| `startup_plan.hpp/.cpp` | The SDO writes that configure a drive in PRE-OP (mapping, sync objects) |
+| `cia402.hpp` | CiA 402 statusword/controlword helpers |
+| `dc_sync.hpp` | PI loop that locks the master's cycle to the drives' distributed clock |
+| `cyclic_controller.hpp/.cpp` | Per-cycle logic: enable sequence, fault detection and recovery, reference ramp |
+| `ethercat_master.hpp/.cpp` | Thin wrapper around SOEM (bus, SDO, states, process data, registers) |
+| `ird_ethercat_system.hpp/.cpp` | The ros2_control plugin: lifecycle, real-time and diagnostics threads |
+
+Everything above `ethercat_master` has no ROS or SOEM dependency and is covered by unit tests.
+The tests need no hardware:
+
+```bash
+colcon build --packages-select ird_ethercat_hardware_interface
+colcon test --packages-select ird_ethercat_hardware_interface --event-handlers console_direct+
+```
+
 ## License
 
 Copyright © 2026 CDEI-UPC. This package is distributed under the **GNU General Public License
