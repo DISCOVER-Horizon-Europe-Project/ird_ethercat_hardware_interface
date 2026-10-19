@@ -90,7 +90,7 @@ install(
   DESTINATION include/${PROJECT_NAME}
 )
 install(
-  DIRECTORY config urdf
+  DIRECTORY config launch urdf
   DESTINATION share/${PROJECT_NAME}
 )
 install(TARGETS ${PROJECT_NAME}

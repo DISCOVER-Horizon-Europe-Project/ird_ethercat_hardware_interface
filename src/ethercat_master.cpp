@@ -32,7 +32,7 @@ bool EthercatMaster::open(const std::string & interface)
   {
     RCLCPP_ERROR(
         logger_, "Failed to initialize SOEM on %s (does the interface exist, and does the process have "
-        "CAP_NET_RAW? see README).", interface.c_str());
+        "CAP_NET_RAW? see docs/troubleshooting.md).", interface.c_str());
     return false;
   }
   open_ = true;

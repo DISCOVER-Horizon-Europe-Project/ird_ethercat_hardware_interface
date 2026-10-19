@@ -50,7 +50,7 @@ namespace
 // boundary; SYNC0 fires bus.sync0_shift_us later. Infranor recommends at
 // least 100 us (IRD manual, error 50) and 200 us for a 4 ms cycle; on a NIC
 // shared with sensor traffic the Naviwall robot needed 2 ms (mid-cycle) to
-// absorb late frames (see README).
+// absorb late frames (see docs/how_it_works.md, section 4).
 constexpr int64_t DC_TARGET_PHASE_NS = 0;
 
 // Minimum lead of the frame over SYNC0 required by the IRD (error 50).
