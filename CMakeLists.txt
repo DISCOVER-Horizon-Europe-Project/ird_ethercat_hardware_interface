@@ -16,6 +16,8 @@ find_package(ament_cmake REQUIRED)
 foreach(dependency IN ITEMS ${THIS_PACKAGE_INCLUDE_DEPENDS})
   find_package(${dependency} REQUIRED)
 endforeach()
+find_package(yaml_cpp_vendor REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 # ---------------------------------------------------------------------------
 # SOEM (Simple Open EtherCAT Master), version 2.x
@@ -53,6 +55,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(ird_ethercat_core STATIC
   src/config.cpp
+  src/config_loader.cpp
   src/cyclic_controller.cpp
   src/pdo.cpp
   src/startup_plan.cpp
@@ -62,6 +65,7 @@ target_compile_features(ird_ethercat_core PUBLIC cxx_std_17)
 target_include_directories(ird_ethercat_core PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
 )
+target_link_libraries(ird_ethercat_core PRIVATE yaml-cpp)
 
 # ---------------------------------------------------------------------------
 # Hardware interface plugin
@@ -86,7 +90,7 @@ install(
   DESTINATION include/${PROJECT_NAME}
 )
 install(
-  DIRECTORY urdf
+  DIRECTORY config urdf
   DESTINATION share/${PROJECT_NAME}
 )
 install(TARGETS ${PROJECT_NAME}
@@ -103,6 +107,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_ird_ethercat_core
     test/test_config.cpp
+    test/test_config_loader.cpp
     test/test_pdo.cpp
     test/test_startup_plan.cpp
     test/test_cia402.cpp
@@ -110,6 +115,8 @@ if(BUILD_TESTING)
     test/test_cyclic_controller.cpp
   )
   target_link_libraries(test_ird_ethercat_core ird_ethercat_core)
+  target_compile_definitions(test_ird_ethercat_core PRIVATE
+    "IRD_CONFIG_DIR=\"${PROJECT_SOURCE_DIR}/config\"")
 endif()
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)

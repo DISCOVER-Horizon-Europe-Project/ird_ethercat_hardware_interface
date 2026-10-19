@@ -4,30 +4,27 @@
   Include it from your robot's URDF/xacro and call the macro, e.g.:
 
     <xacro:include filename="$(find ird_ethercat_hardware_interface)/urdf/ird_ethercat_example.ros2_control.xacro"/>
-    <xacro:ird_ethercat_example name="drives" ethercat_interface="eno1"/>
+    <xacro:ird_ethercat_example name="drives"
+        config_file="$(find my_robot)/config/drives.yaml" ethercat_interface="eno1"/>
 
-  The joint names must also exist as <joint> elements in the URDF.
+  Everything about the drives (bus timing, PDO mapping, units, limits, fault
+  handling) is in the YAML configuration file. The URDF only has to:
+    - name the configuration file,
+    - declare one <joint> per drive, with the names used in the file, each with
+      a `velocity` command interface and `position` + `velocity` state
+      interfaces (in that order).
+  The joints must also exist as <joint> elements of the robot model.
 -->
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-  <xacro:macro name="ird_ethercat_example" params="name ethercat_interface">
+  <xacro:macro name="ird_ethercat_example" params="name config_file ethercat_interface:=''">
     <ros2_control name="${name}" type="system">
       <hardware>
         <plugin>ird_ethercat_hardware_interface/IrdEthercatSystem</plugin>
-        <!-- Network interface connected to the EtherCAT bus (see `ip link`). -->
+        <!-- YAML configuration file (see config/ird_csv_example.yaml). -->
+        <param name="config_file">${config_file}</param>
+        <!-- Optional: overrides bus.interface of the configuration file, e.g.
+             to choose the network interface from a launch argument. -->
         <param name="ethercat_interface">${ethercat_interface}</param>
-        <!-- Joint driven by each drive (must match the <joint> elements below). -->
-        <param name="left_wheel_name">drivewhl_l_joint</param>
-        <param name="right_wheel_name">drivewhl_r_joint</param>
-        <param name="turret_name">turret_joint</param>
-        <!-- EtherCAT position of each drive: 1 = first drive after the master. -->
-        <param name="slave_left_motor">1</param>
-        <param name="slave_right_motor">2</param>
-        <param name="slave_turret_motor">3</param>
-        <!-- Motor revolutions per joint revolution (gearbox ratio). -->
-        <param name="transmission_ratio_wheels">20.0</param>
-        <param name="transmission_ratio_turret">51.67</param>
-        <!-- Drive velocity unit: encoder ticks per motor revolution. -->
-        <param name="encoder_ticks_per_rev">2048</param>
       </hardware>
 
       <joint name="drivewhl_l_joint">

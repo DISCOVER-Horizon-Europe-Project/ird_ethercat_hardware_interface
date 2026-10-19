@@ -39,6 +39,7 @@
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "ird_ethercat_hardware_interface/cia402.hpp"
+#include "ird_ethercat_hardware_interface/config_loader.hpp"
 #include "ird_ethercat_hardware_interface/startup_plan.hpp"
 
 namespace ird_ethercat_hardware_interface
@@ -138,7 +139,7 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_init(const hardware_int
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  if (!load_config_from_urdf_params())
+  if (!load_config())
   {
     return hardware_interface::CallbackReturn::ERROR;
   }
@@ -199,7 +200,57 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_init(const hardware_int
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-// Builds the configuration from the URDF <hardware> parameters of the
+// The configuration comes from the YAML file named by the URDF parameter
+// `config_file`. Without it, the legacy URDF parameters of the three-drive
+// Naviwall layout are used (kept so older robot descriptions still work).
+// The URDF parameter `ethercat_interface` overrides bus.interface either way,
+// so the network interface can still be chosen from a launch argument.
+bool IrdEthercatSystem::load_config()
+{
+  const auto & params = info_.hardware_parameters;
+  const auto file = params.find("config_file");
+  if (file != params.end() && !file->second.empty())
+  {
+    const std::vector<std::string> errors = load_config_file(file->second, config_);
+    for (const std::string & error : errors)
+    {
+      RCLCPP_FATAL(logger_, "Configuration file: %s", error.c_str());
+    }
+    if (!errors.empty())
+    {
+      return false;
+    }
+    for (const char * legacy : {"left_wheel_name", "right_wheel_name", "turret_name", "slave_left_motor",
+                                "slave_right_motor", "slave_turret_motor", "transmission_ratio_wheels",
+                                "transmission_ratio_turret", "encoder_ticks_per_rev"})
+    {
+      if (params.count(legacy))
+      {
+        RCLCPP_WARN(
+            logger_, "URDF parameter '%s' is ignored: the configuration comes from config_file.", legacy);
+      }
+    }
+    RCLCPP_INFO(logger_, "Configuration loaded from %s", file->second.c_str());
+  }
+  else
+  {
+    RCLCPP_INFO(
+        logger_, "No 'config_file' parameter: using the legacy URDF parameters (three drives: left, right, turret).");
+    if (!load_config_from_urdf_params())
+    {
+      return false;
+    }
+  }
+
+  const auto iface = params.find("ethercat_interface");
+  if (iface != params.end() && !iface->second.empty())
+  {
+    config_.bus.interface = iface->second;
+  }
+  return true;
+}
+
+// Builds the configuration from the legacy URDF <hardware> parameters of the
 // three-drive Naviwall layout (left wheel, right wheel, turret).
 bool IrdEthercatSystem::load_config_from_urdf_params()
 {
@@ -248,12 +299,6 @@ bool IrdEthercatSystem::load_config_from_urdf_params()
   };
 
   config_ = SystemConfig{};
-  const auto iface = info_.hardware_parameters.find("ethercat_interface");
-  if (iface != info_.hardware_parameters.end() && !iface->second.empty())
-  {
-    config_.bus.interface = iface->second;
-  }
-
   double ratio_wheels = 0.0;
   double ratio_turret = 0.0;
   int ticks_per_rev = 0;

@@ -133,6 +133,7 @@ private:
   static constexpr size_t TIMING_HISTORY_CYCLES = 128;
 
   // --- Configuration ---
+  bool load_config();
   bool load_config_from_urdf_params();
   bool check_joints();
 
