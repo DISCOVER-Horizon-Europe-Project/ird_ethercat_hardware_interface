@@ -133,6 +133,10 @@ are not right yet (the file itself must be valid). Use it to check the cabling o
 optionally copy `vendor_id` / `product_code` into the configuration so that a drive connected in
 the wrong position is detected.
 
+> **List every drive on the bus.** The configuration must contain every device connected to the
+> EtherCAT chain. To test one drive on its own (for example to isolate a problem), disconnect it
+> from the others and connect it alone to the PC.
+
 ## 5. Write the configuration file
 
 Everything about the drives is in one YAML file. Copy the minimal example and edit it:

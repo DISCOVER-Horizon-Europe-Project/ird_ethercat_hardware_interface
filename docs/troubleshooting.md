@@ -59,6 +59,7 @@ After a ROS update, re-run `setcap`: the update replaces the executable and its 
 | `No EtherCAT slaves found on eno1.` | Nothing answers on that port: wrong port, cable not connected to the drive's **IN** connector, or drives not powered (the EtherCAT part of the IRD needs its logic supply). |
 | `Found N slave(s) on the bus, but the configuration uses slave position M.` | A `slave_position` is higher than the number of devices found. Check the chain (a broken cable or an unpowered drive cuts off the drives behind it) and the positions. The list of devices found is logged just before (`Slave 1: ...`). |
 | `Drive 'x' (slave N): vendor_id is ..., configuration expects ...` (or `product_code`) | The device at that position is not the expected one: drives cabled in a different order, or another device on the bus. |
+| More devices found than drives configured | Every device on the chain must be listed in the configuration. To test fewer drives, disconnect the others. If something fails with several drives, test each drive alone on the cable to find the faulty drive or cable segment. |
 
 ## 4. Configuring the drives (PRE-OP)
 
