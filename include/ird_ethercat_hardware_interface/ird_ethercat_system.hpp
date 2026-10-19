@@ -88,6 +88,19 @@ public:
   hardware_interface::return_type write(const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
 private:
+  /// A PDO entry exposed to ROS as an extra ros2_control interface
+  /// (<joint>/<name>): a state interface for TxPDO entries, a command
+  /// interface for RxPDO entries.
+  struct ExtraInterface
+  {
+    std::string name;
+    size_t offset{0};        ///< in the drive's PDO
+    DataType type{DataType::UINT8};
+    double scale{1.0};       ///< ROS value = raw * scale
+    double value{0.0};       ///< the ros2_control interface value
+    std::atomic<int64_t> raw{0};  ///< raw value shared with the RT thread
+  };
+
   /// Runtime state of one drive.
   struct Drive
   {
@@ -98,24 +111,37 @@ private:
     PdoLayout tx_layout;
     RoleLocation pdo_controlword;
     RoleLocation pdo_mode_of_operation;
-    RoleLocation pdo_target_velocity;
+    RoleLocation pdo_target;  ///< target position, velocity or torque, depending on the mode
     RoleLocation pdo_statusword;
+    RoleLocation pdo_position_actual;
     RoleLocation pdo_velocity_actual;
+    RoleLocation pdo_torque_actual;
+    std::vector<std::unique_ptr<ExtraInterface>> state_extras;    ///< from the TxPDO
+    std::vector<std::unique_ptr<ExtraInterface>> command_extras;  ///< to the RxPDO
     uint8_t * outputs{nullptr};       ///< this drive's RxPDO in the process image
     const uint8_t * inputs{nullptr};  ///< this drive's TxPDO in the process image
 
-    // Unit conversion (drive units: encoder ticks/s at the motor shaft)
-    double ticks_per_rad{0.0};    ///< motor-shaft ticks per radian
-    double max_motor_rad_s{0.0};  ///< command clamp at the motor shaft
+    // Unit conversion. Drive units at the motor shaft: position in encoder
+    // ticks, velocity in ticks/s, torque in 1/1000 of the rated torque.
+    double ticks_per_rad{0.0};         ///< motor-shaft ticks per radian
+    double max_motor_rad_s{0.0};       ///< velocity limit at the motor shaft
+    double torque_units_per_nm{0.0};   ///< drive torque units per motor-shaft Nm
 
     // ros2_control values (joint side, after the gearbox)
-    double cmd{0.0};  ///< commanded velocity [rad/s]
-    double pos{0.0};  ///< position [rad], integrated from the measured velocity
-    double vel{0.0};  ///< measured velocity [rad/s]
+    double cmd{0.0};     ///< command: position [rad], velocity [rad/s] or effort [Nm], per mode
+    double pos{0.0};     ///< position [rad]: from position_actual, else integrated velocity
+    double vel{0.0};     ///< velocity [rad/s]: from velocity_actual, else differentiated position
+    double effort{0.0};  ///< effort [Nm] from torque_actual (if mapped)
+
+    // Unwrapped position (the drive's 32-bit position wraps around)
+    int64_t position_ticks{0};
+    int32_t last_position_raw{0};
 
     // Shared between write()/read() and the process-data thread
-    std::atomic<int32_t> target{0};           ///< requested reference [ticks/s]
-    std::atomic<int32_t> actual_velocity{0};  ///< measured velocity [ticks/s]
+    std::atomic<int32_t> target{0};           ///< reference requested by write() [drive units]
+    std::atomic<int32_t> actual_position{0};  ///< [ticks]
+    std::atomic<int32_t> actual_velocity{0};  ///< [ticks/s]
+    std::atomic<int32_t> actual_torque{0};    ///< [1/1000 rated torque]
     std::atomic<uint16_t> statusword{0};
   };
 
@@ -136,6 +162,8 @@ private:
   bool load_config();
   bool load_config_from_urdf_params();
   bool check_joints();
+  void log_pdo_layout(const Drive & drive) const;
+  void init_joint_states();
 
   // --- Bus start-up and shutdown ---
   bool init_ethercat();
@@ -147,6 +175,8 @@ private:
   std::vector<int> slave_positions() const;
 
   // --- Process data ---
+  void write_outputs(Drive & drive, uint16_t controlword, int32_t reference);
+  uint16_t read_inputs(Drive & drive);
   void stage_outputs(uint16_t controlword_all);
   void run_startup_cycles(uint32_t cycles);
   void start_processdata_thread();
@@ -188,6 +218,7 @@ private:
   // Buffers used by the RT loop, allocated once in on_init()
   std::vector<int32_t> rt_targets_;
   std::vector<int32_t> rt_references_;
+  std::vector<int32_t> rt_actual_positions_;
   std::vector<uint16_t> rt_statuswords_;
   std::vector<uint16_t> rt_controlwords_;
 

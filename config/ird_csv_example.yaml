@@ -107,24 +107,33 @@ fault_handling:
 # Every drive in the `drives` list below starts from these values; a drive can
 # override any of them. Lists (PDO entries, SDOs) are replaced as a whole.
 drive_defaults:
-  # CiA 402 mode of operation (0x6060): csv = cyclic synchronous velocity.
-  # (This version supports csv only.)
+  # CiA 402 mode of operation (0x6060), and the joint command it takes:
+  #   csv  cyclic synchronous velocity  -> joint command interface `velocity` [rad/s]
+  #   csp  cyclic synchronous position  -> joint command interface `position` [rad]
+  #   cst  cyclic synchronous torque    -> joint command interface `effort`   [Nm]
+  # Only csv has been validated on hardware so far. See other_modes_example.yaml
+  # for the PDO mapping that csp and cst need.
   mode: csv
 
-  # Units. The drive's velocity unit is encoder ticks per second at the motor
-  # shaft. The ros2_control joint is after a gearbox of gear_ratio motor
-  # revolutions per joint revolution; joint commands and states are in rad/s
-  # and rad at the joint.
+  # Units. The drive works at the motor shaft: position in encoder ticks,
+  # velocity in ticks per second, torque in 1/1000 of the motor rated torque.
+  # The ros2_control joint is after a gearbox of gear_ratio motor revolutions
+  # per joint revolution; joint values are in rad, rad/s and Nm at the joint.
   encoder_ticks_per_rev: 2048
   gear_ratio: 1.0
+  # Motor rated torque in Nm (the drive's 0x6076, which is in mNm). Only needed
+  # when torque is commanded (target_torque) or read (torque_actual).
+  rated_torque_nm: 0.0
 
-  # Motor speed limit: commands above it are clamped (with a warning).
+  # Motor speed limit. csv: commands above it are clamped (with a warning).
+  # csp: the position reference never moves faster than this.
   max_motor_rpm: 4910
 
-  # After the drives are (re-)enabled, the reference ramps up at this rate
-  # (motor shaft) until it matches the command, so a controller still holding
-  # an old command cannot cause a jump. Slowing down and stopping are always
-  # applied immediately. 0 disables the ramp.
+  # csv only: after the drives are (re-)enabled, the velocity reference ramps
+  # up at this rate (motor shaft) until it matches the command, so a controller
+  # still holding an old command cannot cause a jump. Slowing down and stopping
+  # are always applied immediately. 0 disables the ramp. (In csp the reference
+  # always starts from the actual position, so enabling never moves the axis.)
   enable_ramp_motor_rad_s2: 70
 
   # Optional identity check at startup (0 = do not check). The startup log
@@ -132,12 +141,54 @@ drive_defaults:
   expected_vendor_id: 0
   expected_product_code: 0
 
-  # PDO mapping, written to each drive at startup.
-  # Each entry needs a `role` the interface uses it for, or `none`:
-  #   RxPDO (master -> drive): controlword (uint16) and target_velocity (int32)
-  #                            are required; mode_of_operation (int8) optional.
-  #   TxPDO (drive -> master): statusword (uint16) and velocity_actual (int32)
-  #                            are required; mode_display (int8) optional.
+  # PDO mapping: the objects exchanged with the drive every cycle, written to
+  # the drive at startup. Choose them from the drive's object dictionary (the
+  # object must be marked "PDO mapping: yes/possible"). Sizes and positions in
+  # the frame are computed automatically and logged at startup.
+  #
+  # Each entry has an `object`, a `type`, and at least one of:
+  #
+  #   role       what the interface itself uses the object for:
+  #                RxPDO (master -> drive)
+  #                  controlword        0x6040 uint16  always required
+  #                  mode_of_operation  0x6060 int8    optional (written every cycle)
+  #                  target_velocity    0x60FF int32   required in csv
+  #                  target_position    0x607A int32   required in csp
+  #                  target_torque      0x6071 int16   required in cst
+  #                TxPDO (drive -> master)
+  #                  statusword         0x6041 uint16  always required
+  #                  mode_display       0x6061 int8    optional
+  #                  velocity_actual    0x606C int32   required in csv; gives the joint velocity
+  #                  position_actual    0x6064 int32   required in csp; gives the joint position
+  #                  torque_actual      0x6077 int16   optional; gives the joint effort
+  #              Without position_actual the joint position is integrated from
+  #              the velocity; without velocity_actual the joint velocity is
+  #              derived from the position. One of the two must be mapped.
+  #
+  #   interface  expose the raw object to ROS as the ros2_control interface
+  #              <joint>/<interface>, multiplied by `scale` (default 1):
+  #                TxPDO entries become state interfaces (read): they are
+  #                  published by joint_state_broadcaster on /dynamic_joint_states.
+  #                RxPDO entries become command interfaces (write), e.g. with a
+  #                  forward_command_controller. Only for entries without a role
+  #                  (the interface itself writes those).
+  #              They do not need to be declared in the URDF.
+  #
+  # Example: also read the position, the motor current and the DC-link voltage
+  # (CiA 402 objects; check their units in the drive manual for `scale`):
+  #   tx_pdo:
+  #     index: 0x1A00
+  #     entries:
+  #       - {object: "0x6041:00", type: uint16, role: statusword}
+  #       - {object: "0x606C:00", type: int32,  role: velocity_actual}
+  #       - {object: "0x6064:00", type: int32,  role: position_actual}
+  #       - {object: "0x6078:00", type: int16,  interface: current_actual, scale: 0.001}
+  #       - {object: "0x6079:00", type: uint32, interface: dc_link_voltage, scale: 0.001}
+  #
+  # The IRD accepts up to 4 RxPDOs (0x1600-0x1603) and 4 TxPDOs (0x1A00-0x1A03);
+  # this interface uses one of each. If the drive rejects a mapping (too many
+  # objects, or an object that cannot be mapped), startup fails and the log
+  # shows the SDO abort code (0x06040042: too long, 0x06040041: not mappable).
   rx_pdo:
     index: 0x1600
     entries:
@@ -172,10 +223,11 @@ drive_defaults:
 # -----------------------------------------------------------------------------
 # One entry per drive. Required for each:
 #   name            used in log messages
-#   joint           ros2_control joint driven by this drive (must be declared in
-#                   the <ros2_control> block of the URDF, with a `velocity`
-#                   command interface and `position` + `velocity` state
-#                   interfaces)
+#   joint           ros2_control joint driven by this drive. It must be declared
+#                   in the <ros2_control> block of the URDF with the command
+#                   interface of its mode (velocity / position / effort). Its
+#                   state interfaces can be position, velocity, effort (if
+#                   torque_actual is mapped) and any exposed TxPDO entry.
 #   slave_position  position on the EtherCAT bus: 1 = first drive after the
 #                   master, 2 = the next one, ...
 # Any key of drive_defaults can be added to override it for this drive.

@@ -4,6 +4,8 @@
 
 #include "ird_ethercat_hardware_interface/pdo.hpp"
 
+#include <cstdint>
+
 namespace ird_ethercat_hardware_interface
 {
 
@@ -56,6 +58,22 @@ int64_t read_value(const uint8_t * p, DataType type)
     case DataType::UINT32: return raw;
   }
   return 0;
+}
+
+int64_t saturate(DataType type, int64_t value)
+{
+  int64_t low = 0;
+  int64_t high = 0;
+  switch (type)
+  {
+    case DataType::INT8: low = INT8_MIN; high = INT8_MAX; break;
+    case DataType::UINT8: low = 0; high = UINT8_MAX; break;
+    case DataType::INT16: low = INT16_MIN; high = INT16_MAX; break;
+    case DataType::UINT16: low = 0; high = UINT16_MAX; break;
+    case DataType::INT32: low = INT32_MIN; high = INT32_MAX; break;
+    case DataType::UINT32: low = 0; high = UINT32_MAX; break;
+  }
+  return value < low ? low : (value > high ? high : value);
 }
 
 void write_value(uint8_t * p, DataType type, int64_t value)

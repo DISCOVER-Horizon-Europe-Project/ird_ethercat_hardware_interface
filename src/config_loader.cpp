@@ -244,7 +244,7 @@ void read_pdo(Reader & r, const YAML::Node & node, const std::string & where, ui
     const YAML::Node item = list[i];
     const std::string at = where + ".entries[" + std::to_string(i) + "]";
     if (!r.expect_map(item, at)) continue;
-    r.check_keys(item, at, {"object", "type", "role"});
+    r.check_keys(item, at, {"object", "type", "role", "interface", "scale"});
     PdoEntry entry;
     bool ok = r.object(item, at, entry.index, entry.subindex);
     ok = r.data_type(item, at, entry.type) && ok;
@@ -254,11 +254,13 @@ void read_pdo(Reader & r, const YAML::Node & node, const std::string & where, ui
       {
         r.error(
             role, at + ".role",
-            "expected one of none, controlword, mode_of_operation, target_velocity, statusword, mode_display, "
-            "velocity_actual");
+            "expected one of controlword, mode_of_operation, target_position, target_velocity, target_torque "
+            "(RxPDO) or statusword, mode_display, position_actual, velocity_actual, torque_actual (TxPDO)");
         ok = false;
       }
     }
+    r.string(item, "interface", at, entry.interface);
+    r.real(item, "scale", at, entry.scale);
     if (ok) entries.push_back(entry);
   }
 }
@@ -320,7 +322,7 @@ void read_drive(Reader & r, const YAML::Node & node, const std::string & where, 
 {
   if (!r.expect_map(node, where)) return;
   std::vector<std::string> keys = {
-      "mode", "encoder_ticks_per_rev", "gear_ratio", "max_motor_rpm", "enable_ramp_motor_rad_s2",
+      "mode", "encoder_ticks_per_rev", "gear_ratio", "rated_torque_nm", "max_motor_rpm", "enable_ramp_motor_rad_s2",
       "expected_vendor_id", "expected_product_code", "rx_pdo", "tx_pdo", "startup_sdos", "fault_snapshot"};
   if (per_drive)
   {
@@ -344,6 +346,7 @@ void read_drive(Reader & r, const YAML::Node & node, const std::string & where, 
   }
   r.real(node, "encoder_ticks_per_rev", where, drive.encoder_ticks_per_rev);
   r.real(node, "gear_ratio", where, drive.gear_ratio);
+  r.real(node, "rated_torque_nm", where, drive.rated_torque_nm);
   r.real(node, "max_motor_rpm", where, drive.max_motor_rpm);
   r.real(node, "enable_ramp_motor_rad_s2", where, drive.enable_ramp_motor_rad_s2);
   r.integer(node, "expected_vendor_id", where, drive.expected_vendor_id);

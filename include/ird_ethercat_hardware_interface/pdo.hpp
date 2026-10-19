@@ -44,6 +44,9 @@ RoleLocation find_role(const std::vector<PdoEntry> & entries, const PdoLayout & 
 /// Reads a value of `type` at `p` (sign-extended for signed types).
 int64_t read_value(const uint8_t * p, DataType type);
 
+/// Clamps `value` to the range of `type`.
+int64_t saturate(DataType type, int64_t value);
+
 /// Writes the low size_of(type) bytes of `value` at `p`.
 void write_value(uint8_t * p, DataType type, int64_t value);
 

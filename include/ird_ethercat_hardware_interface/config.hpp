@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ird_ethercat_hardware_interface
@@ -28,19 +29,25 @@ bool is_signed(DataType type);
 const char * to_string(DataType type);  ///< "int8", "uint16", ...
 bool parse_data_type(const std::string & text, DataType & out);
 
-/// What the driver uses a PDO entry for. Entries without a role are only
-/// transferred (they will be exposed as extra ros2_control interfaces).
+/// What the driver itself uses a PDO entry for. Every mapped entry is a real
+/// object of the drive; the role marks the ones the driver needs to run the
+/// drive (state machine, references, feedback). Entries can also (or
+/// instead) be exposed to ROS as ros2_control interfaces, see PdoEntry.
 enum class PdoRole
 {
   NONE,
   // RxPDO (master -> drive)
-  CONTROLWORD,        ///< 0x6040, uint16
+  CONTROLWORD,        ///< 0x6040, uint16 (always required)
   MODE_OF_OPERATION,  ///< 0x6060, int8 (optional: written every cycle if mapped)
-  TARGET_VELOCITY,    ///< 0x60FF, int32
+  TARGET_POSITION,    ///< 0x607A, int32 (required in CSP)
+  TARGET_VELOCITY,    ///< 0x60FF, int32 (required in CSV)
+  TARGET_TORQUE,      ///< 0x6071, int16 (required in CST)
   // TxPDO (drive -> master)
-  STATUSWORD,         ///< 0x6041, uint16
+  STATUSWORD,         ///< 0x6041, uint16 (always required)
   MODE_DISPLAY,       ///< 0x6061, int8 (optional, informative)
-  VELOCITY_ACTUAL,    ///< 0x606C, int32
+  POSITION_ACTUAL,    ///< 0x6064, int32 (required in CSP; gives the joint position state)
+  VELOCITY_ACTUAL,    ///< 0x606C, int32 (required in CSV; gives the joint velocity state)
+  TORQUE_ACTUAL,      ///< 0x6077, int16 (optional; gives the joint effort state)
 };
 
 const char * to_string(PdoRole role);
@@ -49,10 +56,24 @@ bool parse_pdo_role(const std::string & text, PdoRole & out);
 /// One object mapped into a PDO.
 struct PdoEntry
 {
+  PdoEntry() = default;
+  PdoEntry(
+      uint16_t index_, uint8_t subindex_, DataType type_, PdoRole role_ = PdoRole::NONE,
+      std::string interface_ = "", double scale_ = 1.0)
+  : index(index_), subindex(subindex_), type(type_), role(role_), interface(std::move(interface_)), scale(scale_)
+  {
+  }
+
   uint16_t index{0};
   uint8_t subindex{0};
   DataType type{DataType::UINT8};
   PdoRole role{PdoRole::NONE};
+  /// If not empty, the entry is exposed to ROS as the ros2_control interface
+  /// <joint>/<interface>: a state interface for TxPDO entries, a command
+  /// interface for RxPDO entries (only for entries without a role).
+  std::string interface;
+  /// ROS value = raw drive value * scale (e.g. 0.001 for mA -> A).
+  double scale{1.0};
 };
 
 /// One object written by SDO while the drive is in PRE-OP.
@@ -136,9 +157,13 @@ struct DriveConfig
   double encoder_ticks_per_rev{0.0};
   double gear_ratio{1.0};
 
-  double max_motor_rpm{4910.0};  ///< commands above this motor speed are clamped
-  /// After (re-)enabling, ramp the motor-shaft reference up at this rate
-  /// until it matches the command (0 = no ramp). Slowing down is immediate.
+  /// Motor rated torque [Nm] (object 0x6076, in mNm, on the drive). The
+  /// drive's torque unit is 1/1000 of it. Needed when a torque role is mapped.
+  double rated_torque_nm{0.0};
+
+  double max_motor_rpm{4910.0};  ///< velocity commands above this motor speed are clamped (CSV, CSP)
+  /// CSV only: after (re-)enabling, ramp the motor-shaft reference up at this
+  /// rate until it matches the command (0 = no ramp). Slowing down is immediate.
   double enable_ramp_motor_rad_s2{70.0};
 
   uint16_t rx_pdo_index{0x1600};  ///< RxPDO mapping object (master -> drive)
@@ -167,6 +192,10 @@ std::vector<std::string> validate(const SystemConfig & config);
 
 /// Converts a duration to a number of cycles (at least 1).
 uint32_t ms_to_cycles(uint32_t ms, uint32_t cycle_time_us);
+
+/// Name of the ros2_control command interface used in each mode
+/// ("velocity", "position" or "effort").
+const char * command_interface_name(OperationMode mode);
 
 /// Largest number of drives supported (fault masks are 64-bit).
 constexpr size_t MAX_DRIVES = 64;

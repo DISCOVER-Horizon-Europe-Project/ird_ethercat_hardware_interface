@@ -74,3 +74,29 @@ TEST(Pdo, WriteOnlyTouchesItsBytes)
   EXPECT_EQ(buffer[2], 9);
   EXPECT_EQ(buffer[3], 0xAA);
 }
+
+TEST(Pdo, Saturate)
+{
+  EXPECT_EQ(saturate(DataType::INT16, 40000), 32767);
+  EXPECT_EQ(saturate(DataType::INT16, -40000), -32768);
+  EXPECT_EQ(saturate(DataType::UINT8, -5), 0);
+  EXPECT_EQ(saturate(DataType::UINT8, 300), 255);
+  EXPECT_EQ(saturate(DataType::INT32, 5'000'000'000LL), INT32_MAX);
+  EXPECT_EQ(saturate(DataType::UINT32, -1), 0);
+  EXPECT_EQ(saturate(DataType::INT8, -7), -7);
+}
+
+TEST(Pdo, ExtendedLayoutForPowerMonitoring)
+{
+  // The CSV mapping plus position, current and DC-link voltage: 17 bytes.
+  DriveConfig drive = make_ird_csv_drive();
+  drive.tx_pdo.push_back({0x6064, 0, DataType::INT32, PdoRole::POSITION_ACTUAL});
+  drive.tx_pdo.push_back({0x6078, 0, DataType::INT16, PdoRole::NONE, "current_actual", 0.001});
+  drive.tx_pdo.push_back({0x6079, 0, DataType::UINT32, PdoRole::NONE, "dc_link_voltage", 0.001});
+  const PdoLayout layout = compute_layout(drive.tx_pdo);
+  EXPECT_EQ(layout.size_bytes, 17u);
+  EXPECT_EQ(layout.offsets[3], 7u);
+  EXPECT_EQ(layout.offsets[4], 11u);
+  EXPECT_EQ(layout.offsets[5], 13u);
+  EXPECT_EQ(find_role(drive.tx_pdo, layout, PdoRole::POSITION_ACTUAL).offset, 7u);
+}

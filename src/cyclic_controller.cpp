@@ -14,22 +14,23 @@ namespace ird_ethercat_hardware_interface
 {
 
 CyclicController::CyclicController(
-    const FaultHandlingConfig & faults, uint32_t cycle_time_us, std::vector<int32_t> ramp_steps)
+    const FaultHandlingConfig & faults, uint32_t cycle_time_us, std::vector<DriveMotion> drives)
 : stable_cycles_(ms_to_cycles(faults.enable_stable_ms, cycle_time_us)),
   abort_cycles_(ms_to_cycles(faults.enable_fault_abort_ms, cycle_time_us)),
   max_attempts_(faults.max_recovery_attempts),
   cooldown_cycles_(ms_to_cycles(faults.recovery_cooldown_ms, cycle_time_us)),
   reset_pulse_limit_(ms_to_cycles(faults.reset_pulse_ms, cycle_time_us)),
   refill_cycles_(ms_to_cycles(faults.recovery_budget_refill_ms, cycle_time_us)),
-  ramp_steps_(std::move(ramp_steps))
+  motion_(std::move(drives))
 {
   reset();
 }
 
 void CyclicController::reset()
 {
-  fault_cycles_.assign(ramp_steps_.size(), 0);
-  applied_.assign(ramp_steps_.size(), 0);
+  fault_cycles_.assign(motion_.size(), 0);
+  applied_.assign(motion_.size(), 0);
+  last_actual_.assign(motion_.size(), 0);
   ramp_active_ = false;
   stable_enabled_cycles_ = 0;
   in_recovery_ = false;
@@ -46,7 +47,7 @@ CycleFlags CyclicController::begin_cycle(const SharedFlags & shared)
 }
 
 // Post-enable ramp: the reference catches up with the target by at most
-// ramp_steps_[i] per cycle. Stopping, reversing and slowing down are applied
+// motion_[i].ramp_step per cycle. Stopping, reversing and slowing down are applied
 // at once (never delay a stop).
 void CyclicController::slew(size_t i, int32_t target)
 {
@@ -67,22 +68,40 @@ void CyclicController::slew(size_t i, int32_t target)
   }
   else
   {
-    applied += std::clamp(target - applied, -ramp_steps_[i], ramp_steps_[i]);
+    applied += std::clamp(target - applied, -motion_[i].ramp_step, motion_[i].ramp_step);
   }
+}
+
+// CSP: the position reference moves towards the target by at most
+// max_position_step per cycle (the speed limit). Positions wrap around at
+// the int32 limits like the drive's own position, hence the modular difference.
+void CyclicController::step_position(size_t i, int32_t target)
+{
+  const int32_t step = motion_[i].max_position_step;
+  const int64_t diff = static_cast<int32_t>(static_cast<uint32_t>(target) - static_cast<uint32_t>(applied_[i]));
+  const int64_t move = std::clamp<int64_t>(diff, -step, step);
+  applied_[i] = static_cast<int32_t>(static_cast<uint32_t>(applied_[i]) + static_cast<uint32_t>(move));
 }
 
 void CyclicController::stage(
     const CycleFlags & flags, const std::vector<int32_t> & targets, const std::vector<uint16_t> & statuswords,
-    std::vector<uint16_t> & controlwords, std::vector<int32_t> & references)
+    const std::vector<int32_t> & actual_positions, std::vector<uint16_t> & controlwords,
+    std::vector<int32_t> & references)
 {
   const size_t n = applied_.size();
+  std::copy(actual_positions.begin(), actual_positions.end(), last_actual_.begin());
 
-  // ---- References (after the ramp) ----
+  // ---- References (after the ramp / step limit) ----
   if (flags.enable_request && flags.operation_enabled && !flags.force_zero)
   {
-    bool caught_up = true;
+    bool caught_up = true;  // all ramped (CSV/CST) references match their targets
     for (size_t i = 0; i < n; ++i)
     {
+      if (motion_[i].mode == OperationMode::CYCLIC_SYNC_POSITION)
+      {
+        step_position(i, targets[i]);
+        continue;
+      }
       slew(i, targets[i]);
       caught_up = caught_up && applied_[i] == targets[i];
     }
@@ -93,7 +112,10 @@ void CyclicController::stage(
   }
   else
   {
-    std::fill(applied_.begin(), applied_.end(), 0);
+    for (size_t i = 0; i < n; ++i)
+    {
+      applied_[i] = idle_reference(i);
+    }
   }
 
   // ---- Controlwords ----
@@ -122,7 +144,7 @@ void CyclicController::stage(
     controlwords[i] = cw;
 
     const bool apply = flags.enable_request && flags.operation_enabled && !flags.force_zero && !cia402::is_fault(sw);
-    references[i] = apply ? applied_[i] : 0;
+    references[i] = apply ? applied_[i] : idle_reference(i);
   }
 }
 
@@ -239,7 +261,10 @@ CycleEvents CyclicController::evaluate(
       if (++stable_enabled_cycles_ >= stable_cycles_)
       {
         ramp_active_ = true;
-        std::fill(applied_.begin(), applied_.end(), 0);
+        for (size_t i = 0; i < n; ++i)
+        {
+          applied_[i] = idle_reference(i);
+        }
         shared.operation_enabled.store(true);
         shared.force_zero.store(false);
         if (in_recovery_)

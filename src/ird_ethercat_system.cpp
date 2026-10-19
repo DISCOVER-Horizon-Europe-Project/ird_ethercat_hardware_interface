@@ -155,7 +155,7 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_init(const hardware_int
 
   // ---- Per-drive runtime state ----
   const double cycle_s = config_.bus.cycle_time_us * 1e-6;
-  std::vector<int32_t> ramp_steps;
+  std::vector<DriveMotion> motion;
   drives_.clear();
   for (const DriveConfig & cfg : config_.drives)
   {
@@ -165,17 +165,52 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_init(const hardware_int
     drive->tx_layout = compute_layout(cfg.tx_pdo);
     drive->pdo_controlword = find_role(cfg.rx_pdo, drive->rx_layout, PdoRole::CONTROLWORD);
     drive->pdo_mode_of_operation = find_role(cfg.rx_pdo, drive->rx_layout, PdoRole::MODE_OF_OPERATION);
-    drive->pdo_target_velocity = find_role(cfg.rx_pdo, drive->rx_layout, PdoRole::TARGET_VELOCITY);
+    const PdoRole target_role = cfg.mode == OperationMode::CYCLIC_SYNC_POSITION ? PdoRole::TARGET_POSITION
+                                : cfg.mode == OperationMode::CYCLIC_SYNC_TORQUE ? PdoRole::TARGET_TORQUE
+                                                                                : PdoRole::TARGET_VELOCITY;
+    drive->pdo_target = find_role(cfg.rx_pdo, drive->rx_layout, target_role);
     drive->pdo_statusword = find_role(cfg.tx_pdo, drive->tx_layout, PdoRole::STATUSWORD);
+    drive->pdo_position_actual = find_role(cfg.tx_pdo, drive->tx_layout, PdoRole::POSITION_ACTUAL);
     drive->pdo_velocity_actual = find_role(cfg.tx_pdo, drive->tx_layout, PdoRole::VELOCITY_ACTUAL);
+    drive->pdo_torque_actual = find_role(cfg.tx_pdo, drive->tx_layout, PdoRole::TORQUE_ACTUAL);
+
+    // Entries with an interface name become extra ros2_control interfaces.
+    auto add_extras = [](const std::vector<PdoEntry> & entries, const PdoLayout & layout,
+                         std::vector<std::unique_ptr<ExtraInterface>> & extras)
+    {
+      for (size_t i = 0; i < entries.size(); ++i)
+      {
+        if (entries[i].interface.empty()) continue;
+        auto extra = std::make_unique<ExtraInterface>();
+        extra->name = entries[i].interface;
+        extra->offset = layout.offsets[i];
+        extra->type = entries[i].type;
+        extra->scale = entries[i].scale;
+        extras.push_back(std::move(extra));
+      }
+    };
+    add_extras(cfg.tx_pdo, drive->tx_layout, drive->state_extras);
+    add_extras(cfg.rx_pdo, drive->rx_layout, drive->command_extras);
+
     drive->ticks_per_rad = cfg.encoder_ticks_per_rev / (2.0 * M_PI);
     drive->max_motor_rad_s = cfg.max_motor_rpm * 2.0 * M_PI / 60.0;
+    drive->torque_units_per_nm = cfg.rated_torque_nm > 0.0 ? 1000.0 / cfg.rated_torque_nm : 0.0;
 
-    // Largest reference increase per cycle while ramping up after an enable.
-    const double step = cfg.enable_ramp_motor_rad_s2 * cycle_s * drive->ticks_per_rad;
-    ramp_steps.push_back(
-        cfg.enable_ramp_motor_rad_s2 > 0.0 ? std::max<int32_t>(1, static_cast<int32_t>(step))
-                                           : std::numeric_limits<int32_t>::max() / 2);
+    DriveMotion m;
+    m.mode = cfg.mode;
+    if (cfg.mode == OperationMode::CYCLIC_SYNC_VELOCITY && cfg.enable_ramp_motor_rad_s2 > 0.0)
+    {
+      // Largest reference increase per cycle while ramping up after an enable.
+      const double step = cfg.enable_ramp_motor_rad_s2 * cycle_s * drive->ticks_per_rad;
+      m.ramp_step = std::max<int32_t>(1, static_cast<int32_t>(step));
+    }
+    if (cfg.mode == OperationMode::CYCLIC_SYNC_POSITION)
+    {
+      // The speed limit, as the largest position change per cycle.
+      const double step = drive->max_motor_rad_s * cycle_s * drive->ticks_per_rad;
+      m.max_position_step = std::max<int32_t>(1, static_cast<int32_t>(step));
+    }
+    motion.push_back(m);
     drives_.push_back(std::move(drive));
   }
 
@@ -183,14 +218,19 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_init(const hardware_int
   {
     return hardware_interface::CallbackReturn::ERROR;
   }
+  for (const auto & drive : drives_)
+  {
+    log_pdo_layout(*drive);
+  }
 
   const size_t n = drives_.size();
   rt_targets_.assign(n, 0);
   rt_references_.assign(n, 0);
+  rt_actual_positions_.assign(n, 0);
   rt_statuswords_.assign(n, 0);
   rt_controlwords_.assign(n, 0);
   esc_counters_last_.assign(n, {});
-  controller_.emplace(config_.faults, config_.bus.cycle_time_us, ramp_steps);
+  controller_.emplace(config_.faults, config_.bus.cycle_time_us, motion);
   dc_sync_.emplace(static_cast<int64_t>(config_.bus.cycle_time_us) * 1000, DC_TARGET_PHASE_NS);
   master_ = std::make_unique<EthercatMaster>(logger_);
 
@@ -329,15 +369,18 @@ bool IrdEthercatSystem::load_config_from_urdf_params()
   return true;
 }
 
-// Every drive's joint must be declared in the <ros2_control> block with one
-// velocity command and position + velocity states, and every declared joint
-// must be driven by a drive.
+// Every drive's joint must be declared in the <ros2_control> block, every
+// declared joint must be driven by a drive, and the joint's interfaces must be
+// ones the drive provides:
+//   command: the mode's interface (position / velocity / effort), plus any
+//            RxPDO entry exposed with an interface name,
+//   state:   position, velocity, effort (if torque_actual is mapped), plus any
+//            TxPDO entry exposed with an interface name.
+// Extra interfaces do not have to be declared in the URDF.
 bool IrdEthercatSystem::check_joints()
 {
-  std::set<std::string> driven;
   for (const auto & drive : drives_)
   {
-    driven.insert(drive->cfg->joint);
     const bool declared = std::any_of(
         info_.joints.begin(), info_.joints.end(),
         [&](const hardware_interface::ComponentInfo & joint) { return joint.name == drive->cfg->joint; });
@@ -352,28 +395,87 @@ bool IrdEthercatSystem::check_joints()
 
   for (const hardware_interface::ComponentInfo & joint : info_.joints)
   {
-    if (driven.count(joint.name) == 0)
+    const auto it = std::find_if(
+        drives_.begin(), drives_.end(), [&](const auto & drive) { return drive->cfg->joint == joint.name; });
+    if (it == drives_.end())
     {
       RCLCPP_FATAL(logger_, "Joint '%s' is declared in the <ros2_control> block but no drive drives it.", joint.name.c_str());
       return false;
     }
-    if (joint.command_interfaces.size() != 1 || joint.command_interfaces[0].name != hardware_interface::HW_IF_VELOCITY)
+    const Drive & drive = **it;
+    const char * mode_interface = command_interface_name(drive.cfg->mode);
+
+    std::set<std::string> commands{mode_interface};
+    for (const auto & extra : drive.command_extras) commands.insert(extra->name);
+    std::set<std::string> states{hardware_interface::HW_IF_POSITION, hardware_interface::HW_IF_VELOCITY};
+    if (drive.pdo_torque_actual.mapped) states.insert(hardware_interface::HW_IF_EFFORT);
+    for (const auto & extra : drive.state_extras) states.insert(extra->name);
+
+    auto list = [](const std::set<std::string> & names)
+    {
+      std::string text;
+      for (const auto & name : names) text += (text.empty() ? "" : ", ") + name;
+      return text;
+    };
+
+    bool has_mode_interface = false;
+    for (const auto & command : joint.command_interfaces)
+    {
+      has_mode_interface = has_mode_interface || command.name == mode_interface;
+      if (commands.count(command.name) == 0)
+      {
+        RCLCPP_FATAL(
+            logger_, "Joint '%s': drive '%s' has no command interface '%s' (available: %s).", joint.name.c_str(),
+            drive.cfg->name.c_str(), command.name.c_str(), list(commands).c_str());
+        return false;
+      }
+    }
+    if (!has_mode_interface)
     {
       RCLCPP_FATAL(
-          logger_, "Joint '%s' must have exactly one command interface, '%s'.", joint.name.c_str(),
-          hardware_interface::HW_IF_VELOCITY);
+          logger_, "Joint '%s' must declare the command interface '%s' (drive '%s' runs in mode %d).",
+          joint.name.c_str(), mode_interface, drive.cfg->name.c_str(), static_cast<int>(drive.cfg->mode));
       return false;
     }
-    if (joint.state_interfaces.size() != 2 || joint.state_interfaces[0].name != hardware_interface::HW_IF_POSITION ||
-        joint.state_interfaces[1].name != hardware_interface::HW_IF_VELOCITY)
+    for (const auto & state : joint.state_interfaces)
     {
-      RCLCPP_FATAL(
-          logger_, "Joint '%s' must have exactly two state interfaces, '%s' then '%s'.", joint.name.c_str(),
-          hardware_interface::HW_IF_POSITION, hardware_interface::HW_IF_VELOCITY);
-      return false;
+      if (states.count(state.name) == 0)
+      {
+        RCLCPP_FATAL(
+            logger_, "Joint '%s': drive '%s' has no state interface '%s' (available: %s).", joint.name.c_str(),
+            drive.cfg->name.c_str(), state.name.c_str(), list(states).c_str());
+        return false;
+      }
     }
   }
   return true;
+}
+
+// Logs where every mapped object sits in the drive's process data and what
+// it is used for, so the effect of the configuration can be checked.
+void IrdEthercatSystem::log_pdo_layout(const Drive & drive) const
+{
+  const DriveConfig & cfg = *drive.cfg;
+  auto describe = [&](const char * which, uint16_t index, const std::vector<PdoEntry> & entries, const PdoLayout & layout)
+  {
+    std::string text;
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+      const PdoEntry & e = entries[i];
+      char item[160];
+      std::snprintf(
+          item, sizeof(item), "%s0x%04X:%02X %s @%zu", text.empty() ? "" : " | ", e.index, e.subindex,
+          to_string(e.type), layout.offsets[i]);
+      text += item;
+      if (e.role != PdoRole::NONE) text += std::string(" ") + to_string(e.role);
+      if (!e.interface.empty()) text += " -> " + cfg.joint + "/" + e.interface;
+    }
+    RCLCPP_INFO(
+        logger_, "Drive '%s' %s 0x%04X (%zu bytes): %s", cfg.name.c_str(), which, index, layout.size_bytes,
+        text.c_str());
+  };
+  describe("RxPDO", cfg.rx_pdo_index, cfg.rx_pdo, drive.rx_layout);
+  describe("TxPDO", cfg.tx_pdo_index, cfg.tx_pdo, drive.tx_layout);
 }
 
 std::vector<hardware_interface::StateInterface> IrdEthercatSystem::export_state_interfaces()
@@ -381,8 +483,17 @@ std::vector<hardware_interface::StateInterface> IrdEthercatSystem::export_state_
   std::vector<hardware_interface::StateInterface> state_interfaces;
   for (const auto & drive : drives_)
   {
-    state_interfaces.emplace_back(drive->cfg->joint, hardware_interface::HW_IF_POSITION, &drive->pos);
-    state_interfaces.emplace_back(drive->cfg->joint, hardware_interface::HW_IF_VELOCITY, &drive->vel);
+    const std::string & joint = drive->cfg->joint;
+    state_interfaces.emplace_back(joint, hardware_interface::HW_IF_POSITION, &drive->pos);
+    state_interfaces.emplace_back(joint, hardware_interface::HW_IF_VELOCITY, &drive->vel);
+    if (drive->pdo_torque_actual.mapped)
+    {
+      state_interfaces.emplace_back(joint, hardware_interface::HW_IF_EFFORT, &drive->effort);
+    }
+    for (const auto & extra : drive->state_extras)
+    {
+      state_interfaces.emplace_back(joint, extra->name, &extra->value);
+    }
   }
   return state_interfaces;
 }
@@ -392,7 +503,12 @@ std::vector<hardware_interface::CommandInterface> IrdEthercatSystem::export_comm
   std::vector<hardware_interface::CommandInterface> command_interfaces;
   for (const auto & drive : drives_)
   {
-    command_interfaces.emplace_back(drive->cfg->joint, hardware_interface::HW_IF_VELOCITY, &drive->cmd);
+    const std::string & joint = drive->cfg->joint;
+    command_interfaces.emplace_back(joint, command_interface_name(drive->cfg->mode), &drive->cmd);
+    for (const auto & extra : drive->command_extras)
+    {
+      command_interfaces.emplace_back(joint, extra->name, &extra->value);
+    }
   }
   return command_interfaces;
 }
@@ -450,13 +566,8 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_activate(const rclcpp_l
     return hardware_interface::CallbackReturn::ERROR;
   }
 
+  init_joint_states();
   stage_outputs(cia402::CW_DISABLE_VOLTAGE);
-  for (const auto & drive : drives_)
-  {
-    drive->target.store(0);
-    drive->actual_velocity.store(0);
-    drive->statusword.store(static_cast<uint16_t>(read_value(drive->inputs + drive->pdo_statusword.offset, DataType::UINT16)));
-  }
   flags_.force_zero.store(false);
   fault_dump_pending_.store(0);
   low_wkc_reads_ = 0;
@@ -554,11 +665,47 @@ hardware_interface::return_type IrdEthercatSystem::read(const rclcpp::Time & /*t
     }
   }
 
-  // Drive feedback is motor-shaft ticks/s; joints are on the gearbox output.
+  // Drive feedback is at the motor shaft; joints are on the gearbox output.
+  const double dt = period.seconds();
   for (const auto & drive : drives_)
   {
-    drive->vel = drive->actual_velocity.load() / drive->ticks_per_rad / drive->cfg->gear_ratio;
-    drive->pos += drive->vel * period.seconds();
+    const double ticks_per_joint_rad = drive->ticks_per_rad * drive->cfg->gear_ratio;
+    double position = drive->pos;
+    if (drive->pdo_position_actual.mapped)
+    {
+      // Accumulate the change since the last read, so the joint position
+      // keeps counting when the drive's 32-bit position wraps around.
+      const int32_t raw = drive->actual_position.load();
+      drive->position_ticks +=
+          static_cast<int32_t>(static_cast<uint32_t>(raw) - static_cast<uint32_t>(drive->last_position_raw));
+      drive->last_position_raw = raw;
+      position = static_cast<double>(drive->position_ticks) / ticks_per_joint_rad;
+    }
+
+    if (drive->pdo_velocity_actual.mapped)
+    {
+      drive->vel = drive->actual_velocity.load() / ticks_per_joint_rad;
+    }
+    else
+    {
+      drive->vel = dt > 0.0 ? (position - drive->pos) / dt : 0.0;
+    }
+
+    if (!drive->pdo_position_actual.mapped)
+    {
+      position = drive->pos + drive->vel * dt;  // integrate the measured velocity
+    }
+    drive->pos = position;
+
+    if (drive->pdo_torque_actual.mapped)
+    {
+      // Joint torque = motor torque * gear ratio (gearbox losses not modelled).
+      drive->effort = drive->actual_torque.load() / drive->torque_units_per_nm * drive->cfg->gear_ratio;
+    }
+    for (const auto & extra : drive->state_extras)
+    {
+      extra->value = static_cast<double>(extra->raw.load()) * extra->scale;
+    }
   }
   return hardware_interface::return_type::OK;
 }
@@ -570,7 +717,7 @@ hardware_interface::return_type IrdEthercatSystem::write(const rclcpp::Time & /*
   const bool force_zero = flags_.force_zero.load();
   if (force_zero && !first_write_warned_)
   {
-    RCLCPP_WARN(logger_, "SAFETY: force_zero_velocity enabled. Target velocity forced to 0.");
+    RCLCPP_WARN(logger_, "SAFETY: drives stopped (force_zero); commands are ignored until they are enabled again.");
     first_write_warned_ = true;
   }
   else if (!force_zero)
@@ -581,37 +728,113 @@ hardware_interface::return_type IrdEthercatSystem::write(const rclcpp::Time & /*
   const bool apply = !force_zero && flags_.operation_enabled.load();
   for (const auto & drive : drives_)
   {
-    int32_t ticks_s = 0;
-    if (apply)
+    const DriveConfig & cfg = *drive->cfg;
+    const bool finite = std::isfinite(drive->cmd);
+    if (!finite && apply)
     {
-      double joint_rad_s = drive->cmd;
-      if (!std::isfinite(joint_rad_s))
-      {
-        RCLCPP_ERROR_THROTTLE(
-            logger_, steady_clock_, 1000,
-            "Drive '%s' received non-finite velocity command (%f rad/s). Forcing target velocity to 0.",
-            drive->cfg->name.c_str(), joint_rad_s);
-        joint_rad_s = 0.0;
-      }
-
-      // Joint command is gearbox-output rad/s; the drive expects motor-shaft
-      // ticks/s. The speed limit is a motor-shaft limit, hence applied after
-      // the gear ratio.
-      double motor_rad_s = joint_rad_s * drive->cfg->gear_ratio;
-      if (std::fabs(motor_rad_s) > drive->max_motor_rad_s)
-      {
-        const double clamped = std::clamp(motor_rad_s, -drive->max_motor_rad_s, drive->max_motor_rad_s);
-        RCLCPP_WARN_THROTTLE(
-            logger_, steady_clock_, 1000,
-            "Drive '%s' motor velocity %.6f rad/s exceeds %.6f rad/s (%.1f rpm). Clamping to %.6f rad/s.",
-            drive->cfg->name.c_str(), motor_rad_s, drive->max_motor_rad_s, drive->cfg->max_motor_rpm, clamped);
-        motor_rad_s = clamped;
-      }
-      ticks_s = static_cast<int32_t>(motor_rad_s * drive->ticks_per_rad);
+      RCLCPP_ERROR_THROTTLE(
+          logger_, steady_clock_, 1000, "Drive '%s' received a non-finite %s command (%f); %s.", cfg.name.c_str(),
+          command_interface_name(cfg.mode), drive->cmd,
+          cfg.mode == OperationMode::CYCLIC_SYNC_POSITION ? "holding the current position" : "using 0");
     }
-    drive->target.store(ticks_s);
+
+    int32_t target = 0;
+    switch (cfg.mode)
+    {
+      case OperationMode::CYCLIC_SYNC_VELOCITY:
+        if (apply)
+        {
+          // Joint rad/s -> motor-shaft ticks/s. The speed limit is a
+          // motor-shaft limit, hence applied after the gear ratio.
+          double motor_rad_s = finite ? drive->cmd * cfg.gear_ratio : 0.0;
+          if (std::fabs(motor_rad_s) > drive->max_motor_rad_s)
+          {
+            const double clamped = std::clamp(motor_rad_s, -drive->max_motor_rad_s, drive->max_motor_rad_s);
+            RCLCPP_WARN_THROTTLE(
+                logger_, steady_clock_, 1000,
+                "Drive '%s' motor velocity %.6f rad/s exceeds %.6f rad/s (%.1f rpm). Clamping to %.6f rad/s.",
+                cfg.name.c_str(), motor_rad_s, drive->max_motor_rad_s, cfg.max_motor_rpm, clamped);
+            motor_rad_s = clamped;
+          }
+          target = static_cast<int32_t>(motor_rad_s * drive->ticks_per_rad);
+        }
+        break;
+
+      case OperationMode::CYCLIC_SYNC_POSITION:
+        // Joint rad -> motor-shaft ticks, in the same (wrapping) 32-bit range
+        // as the drive's position. The speed limit is applied by the
+        // process-data thread as a maximum step per cycle.
+        if (finite)
+        {
+          const int64_t ticks = std::llround(drive->cmd * cfg.gear_ratio * drive->ticks_per_rad);
+          target = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(ticks)));
+        }
+        else
+        {
+          target = drive->actual_position.load();
+        }
+        break;
+
+      case OperationMode::CYCLIC_SYNC_TORQUE:
+        if (apply && finite)
+        {
+          // Joint Nm -> motor-shaft Nm -> 1/1000 of the rated torque.
+          const double units = drive->cmd / cfg.gear_ratio * drive->torque_units_per_nm;
+          target = static_cast<int32_t>(saturate(DataType::INT16, std::llround(units)));
+        }
+        break;
+    }
+    drive->target.store(target);
+
+    // Extra command interfaces: ROS value / scale -> raw, clamped to the type.
+    for (const auto & extra : drive->command_extras)
+    {
+      if (std::isfinite(extra->value))
+      {
+        extra->raw.store(saturate(extra->type, std::llround(extra->value / extra->scale)));
+      }
+    }
   }
   return hardware_interface::return_type::OK;
+}
+
+// Reads the drives' feedback once (after the start-up cycles, before the RT
+// thread starts) so the joint states start from the real values. In CSP the
+// command and the reference start at the actual position, so that enabling
+// the drive never moves it.
+void IrdEthercatSystem::init_joint_states()
+{
+  for (const auto & drive : drives_)
+  {
+    const uint8_t * in = drive->inputs;
+    auto read_role = [in](const RoleLocation & role) -> int64_t { return role.mapped ? read_value(in + role.offset, role.type) : 0; };
+
+    const int32_t position = static_cast<int32_t>(read_role(drive->pdo_position_actual));
+    drive->actual_position.store(position);
+    drive->actual_velocity.store(static_cast<int32_t>(read_role(drive->pdo_velocity_actual)));
+    drive->actual_torque.store(static_cast<int32_t>(read_role(drive->pdo_torque_actual)));
+    drive->statusword.store(static_cast<uint16_t>(read_role(drive->pdo_statusword)));
+    for (const auto & extra : drive->state_extras)
+    {
+      extra->raw.store(read_value(in + extra->offset, extra->type));
+    }
+
+    if (drive->pdo_position_actual.mapped)
+    {
+      drive->last_position_raw = position;
+      drive->position_ticks = position;
+      drive->pos = static_cast<double>(position) / (drive->ticks_per_rad * drive->cfg->gear_ratio);
+    }
+    if (drive->cfg->mode == OperationMode::CYCLIC_SYNC_POSITION)
+    {
+      drive->cmd = drive->pos;
+      drive->target.store(position);
+    }
+    else
+    {
+      drive->target.store(0);
+    }
+  }
 }
 
 // =========================================================================
@@ -995,18 +1218,59 @@ void IrdEthercatSystem::shutdown_ethercat()
 // Process data
 // =========================================================================
 
-// Stages the same controlword and a zero reference for every drive.
+// Writes one drive's outputs into the process image: controlword, mode of
+// operation (if mapped), reference of its mode, and the extra command values.
+void IrdEthercatSystem::write_outputs(Drive & drive, uint16_t controlword, int32_t reference)
+{
+  write_value(drive.outputs + drive.pdo_controlword.offset, DataType::UINT16, controlword);
+  if (drive.pdo_mode_of_operation.mapped)
+  {
+    write_value(drive.outputs + drive.pdo_mode_of_operation.offset, DataType::INT8, static_cast<int8_t>(drive.cfg->mode));
+  }
+  write_value(drive.outputs + drive.pdo_target.offset, drive.pdo_target.type, reference);
+  for (const auto & extra : drive.command_extras)
+  {
+    write_value(drive.outputs + extra->offset, extra->type, extra->raw.load());
+  }
+}
+
+// Publishes one drive's inputs for read(); returns its statusword.
+uint16_t IrdEthercatSystem::read_inputs(Drive & drive)
+{
+  const uint8_t * in = drive.inputs;
+  const uint16_t statusword = static_cast<uint16_t>(read_value(in + drive.pdo_statusword.offset, DataType::UINT16));
+  drive.statusword.store(statusword);
+  if (drive.pdo_position_actual.mapped)
+  {
+    drive.actual_position.store(static_cast<int32_t>(read_value(in + drive.pdo_position_actual.offset, DataType::INT32)));
+  }
+  if (drive.pdo_velocity_actual.mapped)
+  {
+    drive.actual_velocity.store(static_cast<int32_t>(read_value(in + drive.pdo_velocity_actual.offset, DataType::INT32)));
+  }
+  if (drive.pdo_torque_actual.mapped)
+  {
+    drive.actual_torque.store(static_cast<int32_t>(read_value(in + drive.pdo_torque_actual.offset, DataType::INT16)));
+  }
+  for (const auto & extra : drive.state_extras)
+  {
+    extra->raw.store(read_value(in + extra->offset, extra->type));
+  }
+  return statusword;
+}
+
+// Stages the same controlword for every drive, with an idle reference
+// (zero velocity/torque, or the actual position in CSP).
 void IrdEthercatSystem::stage_outputs(uint16_t controlword_all)
 {
   for (const auto & drive : drives_)
   {
     if (!drive->outputs) continue;
-    write_value(drive->outputs + drive->pdo_controlword.offset, DataType::UINT16, controlword_all);
-    if (drive->pdo_mode_of_operation.mapped)
-    {
-      write_value(drive->outputs + drive->pdo_mode_of_operation.offset, DataType::INT8, static_cast<int8_t>(drive->cfg->mode));
-    }
-    write_value(drive->outputs + drive->pdo_target_velocity.offset, DataType::INT32, 0);
+    const bool csp = drive->cfg->mode == OperationMode::CYCLIC_SYNC_POSITION;
+    const int32_t idle = csp && drive->inputs
+        ? static_cast<int32_t>(read_value(drive->inputs + drive->pdo_position_actual.offset, DataType::INT32))
+        : 0;
+    write_outputs(*drive, controlword_all, idle);
   }
 }
 
@@ -1070,9 +1334,10 @@ void IrdEthercatSystem::stop_processdata_thread()
 
 // The RT loop. Every cycle it:
 //  1. sleeps until the next absolute deadline (corrected by the DC PI loop),
-//  2. stages controlword + reference of every drive (CyclicController::stage),
+//  2. stages controlword + reference of every drive (CyclicController::stage)
+//     and the extra command values,
 //  3. exchanges one frame and updates the DC lock and the timing history,
-//  4. publishes statuswords and measured velocities for read(),
+//  4. publishes the drives' feedback and extra state values for read(),
 //  5. detects drive faults and runs the recovery (CyclicController::evaluate).
 void IrdEthercatSystem::processdata_loop()
 {
@@ -1123,17 +1388,14 @@ void IrdEthercatSystem::processdata_loop()
       const Drive & drive = *drives_[i];
       rt_targets_[i] = drive.target.load();
       rt_statuswords_[i] = static_cast<uint16_t>(read_value(drive.inputs + drive.pdo_statusword.offset, DataType::UINT16));
+      rt_actual_positions_[i] = drive.pdo_position_actual.mapped
+          ? static_cast<int32_t>(read_value(drive.inputs + drive.pdo_position_actual.offset, DataType::INT32))
+          : 0;
     }
-    controller_->stage(flags, rt_targets_, rt_statuswords_, rt_controlwords_, rt_references_);
+    controller_->stage(flags, rt_targets_, rt_statuswords_, rt_actual_positions_, rt_controlwords_, rt_references_);
     for (size_t i = 0; i < n; ++i)
     {
-      Drive & drive = *drives_[i];
-      write_value(drive.outputs + drive.pdo_controlword.offset, DataType::UINT16, rt_controlwords_[i]);
-      if (drive.pdo_mode_of_operation.mapped)
-      {
-        write_value(drive.outputs + drive.pdo_mode_of_operation.offset, DataType::INT8, static_cast<int8_t>(drive.cfg->mode));
-      }
-      write_value(drive.outputs + drive.pdo_target_velocity.offset, DataType::INT32, rt_references_[i]);
+      write_outputs(*drives_[i], rt_controlwords_[i], rt_references_[i]);
     }
 
     // ---- 3. Exchange the frame, DC lock and timing history ----
@@ -1185,11 +1447,7 @@ void IrdEthercatSystem::processdata_loop()
     // ---- 4. Publish inputs ----
     for (size_t i = 0; i < n; ++i)
     {
-      Drive & drive = *drives_[i];
-      rt_statuswords_[i] = static_cast<uint16_t>(read_value(drive.inputs + drive.pdo_statusword.offset, DataType::UINT16));
-      drive.statusword.store(rt_statuswords_[i]);
-      drive.actual_velocity.store(
-          static_cast<int32_t>(read_value(drive.inputs + drive.pdo_velocity_actual.offset, DataType::INT32)));
+      rt_statuswords_[i] = read_inputs(*drives_[i]);
     }
 
     // ---- 5. Fault detection and recovery ----

@@ -7,20 +7,24 @@ A [ros2_control](https://control.ros.org) hardware interface for **Infranor IRD*
 Developed by **CDEI-UPC** (Centre de Disseny d'Equips Industrials, Universitat Politècnica de
 Catalunya) within the DISCOVER Horizon Europe project.
 
-> **Status: under development.** Any number of drives in Cyclic Synchronous Velocity mode,
-> configured from one YAML file. Coming next: extra PDO objects exposed to ROS and selectable
-> CSP/CSV/CST modes.
+> **Status: under development.** Any number of drives, configured from one YAML file. Cyclic
+> synchronous velocity (CSV) is validated on hardware; position (CSP) and torque (CST) are
+> implemented but not yet validated on hardware.
 
 ## What it does
 
-- Configures every drive at startup over SDO from a YAML file: mode of operation, PDO mapping,
-  any extra objects you list, cycle period (0x1006) and synchronisation mode (0x2012).
+- Configures every drive at startup over SDO from a YAML file: mode of operation (CSV, CSP or
+  CST), PDO mapping, any extra objects you list, cycle period (0x1006) and synchronisation
+  mode (0x2012).
+- Exposes any object you add to the PDO mapping (currents, voltages, position, digital I/O...)
+  to ROS as a ros2_control interface, with no code changes.
 - Exchanges process data every cycle (4 ms by default) from a dedicated real-time thread (SCHED_FIFO). The
   thread is synchronised to the drives with **distributed clocks** (DC SYNC0, IRD *HardSync*).
 - Runs the CiA 402 enable sequence through the cyclic controlword. No SDO traffic happens
   during operation.
 - Recovers automatically, within a bounded number of attempts, from transient fieldbus faults
-  (IRD errors 49/50), then ramps the velocity references back up smoothly.
+  (IRD errors 49/50), then resumes smoothly (velocity ramp in CSV; in CSP the reference always
+  starts from the actual position).
 - Logs fault snapshots (by default 0x603F, 0x1001, 0x3022, 0x3024), ESC error counters and per-cycle
   timing from a separate diagnostics thread, so diagnostics never stall the control loop.
 
@@ -127,10 +131,30 @@ Add a `<ros2_control>` block to your URDF. A ready-to-use xacro macro is in
 </ros2_control>
 ```
 
-Declare one joint per drive, with the names used in the configuration file. Each joint needs
-one `velocity` command interface and the `position` and `velocity` state interfaces, in that
-order. Commands and states are in rad/s and rad at the joint, after the gearbox. The position is
-integrated from the measured velocity.
+Declare one joint per drive, with the names used in the configuration file:
+
+| | Interfaces | Units (at the joint) |
+|---|---|---|
+| Command | the mode's interface: `velocity` (CSV), `position` (CSP) or `effort` (CST) | rad/s, rad, Nm |
+| State | any of `position`, `velocity`, and `effort` (if `torque_actual` is mapped) | rad, rad/s, Nm |
+
+The joint position comes from the drive's `position_actual` if it is mapped, otherwise it is
+integrated from the velocity. The velocity comes from `velocity_actual` if it is mapped,
+otherwise it is derived from the position.
+
+### 3. Read or write other drive registers
+
+Any object added to the PDO mapping with an `interface` name becomes a ros2_control interface
+`<joint>/<interface>`. It does not need to be declared in the URDF. For example, with
+
+```yaml
+- {object: "0x6078:00", type: int16, interface: current_actual, scale: 0.001}
+```
+
+in a drive's `tx_pdo`, `joint_state_broadcaster` publishes the motor current of that joint on
+`/dynamic_joint_states`. Entries in `rx_pdo` with an `interface` name become command interfaces
+that a controller (for example `forward_command_controller`) can write. At startup the log lists
+every mapped object of every drive, with its position in the frame and what it is used for.
 
 *Legacy parameters:* without `config_file`, the URDF parameters of the original three-drive
 layout (`left_wheel_name`, `slave_left_motor`, `transmission_ratio_wheels`,

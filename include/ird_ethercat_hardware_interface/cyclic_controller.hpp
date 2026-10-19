@@ -5,7 +5,11 @@
 // Per-cycle logic of the process-data thread, independent of EtherCAT:
 //  - CiA 402 enable sequence through the cyclic controlword,
 //  - runtime fault detection and bounded automatic recovery,
-//  - velocity reference ramp after an enable.
+//  - how each drive's reference moves, depending on its mode:
+//      CSV  velocity; ramped up after an enable, zero when not commanding,
+//      CSP  position; moves at most max_position_step per cycle, and holds
+//           the actual position when not commanding (no jump on enable),
+//      CST  torque; follows the command, zero when not commanding.
 //
 // The real-time thread calls, every cycle:
 //   flags = begin_cycle(shared)            snapshot of the shared flags
@@ -22,12 +26,24 @@
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "ird_ethercat_hardware_interface/config.hpp"
 
 namespace ird_ethercat_hardware_interface
 {
+
+/// How one drive's reference is produced.
+struct DriveMotion
+{
+  OperationMode mode{OperationMode::CYCLIC_SYNC_VELOCITY};
+  /// CSV: largest increase of the reference per cycle while ramping up after
+  /// an enable (drive units).
+  int32_t ramp_step{std::numeric_limits<int32_t>::max() / 2};
+  /// CSP: largest change of the position reference per cycle (drive units).
+  int32_t max_position_step{std::numeric_limits<int32_t>::max() / 2};
+};
 
 /// Flags shared between the lifecycle callbacks, write() and the RT thread.
 struct SharedFlags
@@ -64,9 +80,7 @@ struct CycleEvents
 class CyclicController
 {
 public:
-  /// ramp_steps[i]: largest increase of drive i's reference per cycle while
-  /// ramping up after an enable (drive units).
-  CyclicController(const FaultHandlingConfig & faults, uint32_t cycle_time_us, std::vector<int32_t> ramp_steps);
+  CyclicController(const FaultHandlingConfig & faults, uint32_t cycle_time_us, std::vector<DriveMotion> drives);
 
   /// Restores the state of a freshly started process-data thread.
   void reset();
@@ -74,10 +88,12 @@ public:
   static CycleFlags begin_cycle(const SharedFlags & shared);
 
   /// Computes the controlword and reference of every drive for the next frame.
-  /// targets: references requested by write(). statuswords: last received.
+  /// targets: references requested by write(). statuswords and
+  /// actual_positions: last received (actual_positions only used in CSP).
   void stage(
       const CycleFlags & flags, const std::vector<int32_t> & targets, const std::vector<uint16_t> & statuswords,
-      std::vector<uint16_t> & controlwords, std::vector<int32_t> & references);
+      const std::vector<int32_t> & actual_positions, std::vector<uint16_t> & controlwords,
+      std::vector<int32_t> & references);
 
   /// Updates the fault and enable state from the statuswords just received.
   CycleEvents evaluate(const CycleFlags & flags, const std::vector<uint16_t> & statuswords, SharedFlags & shared);
@@ -88,6 +104,13 @@ public:
 
 private:
   void slew(size_t i, int32_t target);
+  void step_position(size_t i, int32_t target);
+  /// Reference sent while not commanding: hold the actual position in CSP,
+  /// zero velocity/torque otherwise.
+  int32_t idle_reference(size_t i) const
+  {
+    return motion_[i].mode == OperationMode::CYCLIC_SYNC_POSITION ? last_actual_[i] : 0;
+  }
 
   // Configuration, in cycles
   uint32_t stable_cycles_;
@@ -96,11 +119,12 @@ private:
   uint32_t cooldown_cycles_;
   uint32_t reset_pulse_limit_;
   uint32_t refill_cycles_;
-  std::vector<int32_t> ramp_steps_;
+  std::vector<DriveMotion> motion_;
 
   // State
   std::vector<uint32_t> fault_cycles_;  ///< consecutive cycles each drive has been in FAULT
-  std::vector<int32_t> applied_;        ///< references after the ramp
+  std::vector<int32_t> applied_;        ///< references after the ramp / step limit
+  std::vector<int32_t> last_actual_;    ///< actual positions seen by the last stage()
   bool ramp_active_{false};
   uint32_t stable_enabled_cycles_{0};
   bool in_recovery_{false};

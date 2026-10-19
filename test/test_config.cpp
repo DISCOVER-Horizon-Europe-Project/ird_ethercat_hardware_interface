@@ -72,7 +72,7 @@ TEST(Config, MissingAndMistypedRolesAreRejected)
   SystemConfig config = naviwall_config();
   config.drives[0].tx_pdo.pop_back();                   // no velocity_actual
   config.drives[1].rx_pdo[2].type = DataType::UINT32;   // target_velocity must be int32
-  config.drives[2].rx_pdo.push_back({0x6040, 0, DataType::UINT16, PdoRole::CONTROLWORD});  // twice
+  config.drives[2].rx_pdo.push_back({0x6040, 1, DataType::UINT16, PdoRole::CONTROLWORD});  // twice
   const auto errors = validate(config);
   EXPECT_TRUE(contains(errors, "needs an entry with role velocity_actual"));
   EXPECT_TRUE(contains(errors, "must be of type int32"));
@@ -86,11 +86,81 @@ TEST(Config, RoleInTheWrongPdoIsRejected)
   EXPECT_TRUE(contains(validate(config), "role statusword is not allowed in the RxPDO"));
 }
 
-TEST(Config, OnlyCsvIsAcceptedForNow)
+TEST(Config, CspNeedsPositionRoles)
 {
   SystemConfig config = naviwall_config();
-  config.drives[0].mode = OperationMode::CYCLIC_SYNC_POSITION;
-  EXPECT_TRUE(contains(validate(config), "only mode CSV"));
+  config.drives[0].mode = OperationMode::CYCLIC_SYNC_POSITION;  // still the CSV mapping
+  const auto errors = validate(config);
+  EXPECT_TRUE(contains(errors, "needs an entry with role target_position"));
+  EXPECT_TRUE(contains(errors, "needs an entry with role position_actual"));
+  EXPECT_TRUE(contains(errors, "role target_velocity is not allowed in the RxPDO"));
+}
+
+TEST(Config, ValidCspAndCstDrives)
+{
+  SystemConfig config = naviwall_config();
+  DriveConfig & csp = config.drives[0];
+  csp.mode = OperationMode::CYCLIC_SYNC_POSITION;
+  csp.rx_pdo = {{0x6040, 0, DataType::UINT16, PdoRole::CONTROLWORD},
+                {0x6060, 0, DataType::INT8, PdoRole::MODE_OF_OPERATION},
+                {0x607A, 0, DataType::INT32, PdoRole::TARGET_POSITION}};
+  csp.tx_pdo = {{0x6041, 0, DataType::UINT16, PdoRole::STATUSWORD},
+                {0x6064, 0, DataType::INT32, PdoRole::POSITION_ACTUAL},
+                {0x606C, 0, DataType::INT32, PdoRole::VELOCITY_ACTUAL}};
+  DriveConfig & cst = config.drives[1];
+  cst.mode = OperationMode::CYCLIC_SYNC_TORQUE;
+  cst.rated_torque_nm = 1.2;
+  cst.rx_pdo = {{0x6040, 0, DataType::UINT16, PdoRole::CONTROLWORD},
+                {0x6071, 0, DataType::INT16, PdoRole::TARGET_TORQUE}};
+  cst.tx_pdo = {{0x6041, 0, DataType::UINT16, PdoRole::STATUSWORD},
+                {0x606C, 0, DataType::INT32, PdoRole::VELOCITY_ACTUAL},
+                {0x6077, 0, DataType::INT16, PdoRole::TORQUE_ACTUAL}};
+  EXPECT_TRUE(validate(config).empty());
+
+  cst.rated_torque_nm = 0.0;
+  EXPECT_TRUE(contains(validate(config), "rated_torque_nm must be > 0"));
+}
+
+TEST(Config, TorqueModeStillNeedsAPositionOrVelocityFeedback)
+{
+  SystemConfig config = naviwall_config();
+  DriveConfig & cst = config.drives[0];
+  cst.mode = OperationMode::CYCLIC_SYNC_TORQUE;
+  cst.rated_torque_nm = 1.0;
+  cst.rx_pdo = {{0x6040, 0, DataType::UINT16, PdoRole::CONTROLWORD}, {0x6071, 0, DataType::INT16, PdoRole::TARGET_TORQUE}};
+  cst.tx_pdo = {{0x6041, 0, DataType::UINT16, PdoRole::STATUSWORD}};
+  EXPECT_TRUE(contains(validate(config), "needs position_actual or velocity_actual"));
+}
+
+TEST(Config, ExtraInterfaceRules)
+{
+  SystemConfig config = naviwall_config();
+  DriveConfig & drive = config.drives[0];
+  drive.tx_pdo.push_back({0x6078, 0, DataType::INT16, PdoRole::NONE, "current_actual", 0.001});
+  drive.tx_pdo.push_back({0x6079, 0, DataType::UINT32, PdoRole::NONE, "dc_link_voltage", 0.001});
+  drive.tx_pdo[0].interface = "statusword";  // a role entry can also be exposed (read-only)
+  EXPECT_TRUE(validate(config).empty());
+
+  drive.tx_pdo.push_back({0x2000, 0, DataType::UINT8});                                   // unused
+  drive.tx_pdo.push_back({0x2001, 0, DataType::UINT8, PdoRole::NONE, "current_actual"});  // duplicate
+  drive.tx_pdo.push_back({0x2002, 0, DataType::UINT8, PdoRole::NONE, "velocity"});        // reserved
+  drive.tx_pdo.push_back({0x2003, 0, DataType::UINT8, PdoRole::NONE, "bad-name"});        // characters
+  drive.tx_pdo.push_back({0x2004, 0, DataType::UINT8, PdoRole::NONE, "zero", 0.0});       // scale
+  drive.rx_pdo[0].interface = "controlword";  // the driver writes it: cannot be a command interface
+  const auto errors = validate(config);
+  EXPECT_TRUE(contains(errors, "0x2000:00 has neither a role nor an interface name"));
+  EXPECT_TRUE(contains(errors, "'current_actual' is used more than once"));
+  EXPECT_TRUE(contains(errors, "'velocity' is reserved"));
+  EXPECT_TRUE(contains(errors, "'bad-name' may only contain"));
+  EXPECT_TRUE(contains(errors, "scale must be a non-zero number"));
+  EXPECT_TRUE(contains(errors, "cannot also be a command interface"));
+}
+
+TEST(Config, CommandInterfaceNames)
+{
+  EXPECT_STREQ(command_interface_name(OperationMode::CYCLIC_SYNC_POSITION), "position");
+  EXPECT_STREQ(command_interface_name(OperationMode::CYCLIC_SYNC_VELOCITY), "velocity");
+  EXPECT_STREQ(command_interface_name(OperationMode::CYCLIC_SYNC_TORQUE), "effort");
 }
 
 TEST(Config, BusLimitsAreChecked)
@@ -129,8 +199,9 @@ TEST(Config, TypeAndRoleNamesRoundTrip)
     ASSERT_TRUE(parse_data_type(to_string(type), parsed));
     EXPECT_EQ(parsed, type);
   }
-  for (PdoRole role : {PdoRole::NONE, PdoRole::CONTROLWORD, PdoRole::MODE_OF_OPERATION, PdoRole::TARGET_VELOCITY,
-                       PdoRole::STATUSWORD, PdoRole::MODE_DISPLAY, PdoRole::VELOCITY_ACTUAL})
+  for (PdoRole role : {PdoRole::NONE, PdoRole::CONTROLWORD, PdoRole::MODE_OF_OPERATION, PdoRole::TARGET_POSITION,
+                       PdoRole::TARGET_VELOCITY, PdoRole::TARGET_TORQUE, PdoRole::STATUSWORD, PdoRole::MODE_DISPLAY,
+                       PdoRole::POSITION_ACTUAL, PdoRole::VELOCITY_ACTUAL, PdoRole::TORQUE_ACTUAL})
   {
     PdoRole parsed{};
     ASSERT_TRUE(parse_pdo_role(to_string(role), parsed));

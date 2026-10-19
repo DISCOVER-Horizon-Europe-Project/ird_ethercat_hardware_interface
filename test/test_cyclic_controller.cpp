@@ -237,17 +237,20 @@ private:
 // =========================================================================
 struct Bench
 {
-  explicit Bench(size_t n = 3)
-  : controller(naviwall_config().faults, 4000, std::vector<int32_t>(n, RAMP_STEP)),
-    drives(n), targets(n, 0), statuswords(n, 0), controlwords(n, 0), references(n, 0)
+  explicit Bench(size_t n = 3) : Bench(std::vector<DriveMotion>(n, DriveMotion{OperationMode::CYCLIC_SYNC_VELOCITY, RAMP_STEP})) {}
+
+  explicit Bench(const std::vector<DriveMotion> & motion)
+  : controller(naviwall_config().faults, 4000, motion),
+    drives(motion.size()), targets(motion.size(), 0), statuswords(motion.size(), 0),
+    actual_positions(motion.size(), 0), controlwords(motion.size(), 0), references(motion.size(), 0)
   {
-    for (size_t i = 0; i < n; ++i) statuswords[i] = drives[i].statusword();
+    for (size_t i = 0; i < motion.size(); ++i) statuswords[i] = drives[i].statusword();
   }
 
   CycleEvents cycle()
   {
     const CycleFlags f = CyclicController::begin_cycle(flags);
-    controller.stage(f, targets, statuswords, controlwords, references);
+    controller.stage(f, targets, statuswords, actual_positions, controlwords, references);
     for (size_t i = 0; i < drives.size(); ++i)
     {
       drives[i].receive(controlwords[i]);
@@ -279,6 +282,7 @@ struct Bench
   std::vector<FakeDrive> drives;
   std::vector<int32_t> targets;
   std::vector<uint16_t> statuswords;
+  std::vector<int32_t> actual_positions;
   std::vector<uint16_t> controlwords;
   std::vector<int32_t> references;
   CycleEvents last;
@@ -550,4 +554,102 @@ TEST(CyclicController, IdenticalToV010UnderRandomFaults)
   // The scenario must actually have exercised the recovery paths.
   EXPECT_GT(faults, 50);
   EXPECT_GT(recoveries, 20);
+}
+
+// =========================================================================
+// CSP and CST
+// =========================================================================
+namespace
+{
+constexpr int32_t MAX_STEP = 500;  // ticks per cycle
+
+Bench csp_bench()
+{
+  return Bench(std::vector<DriveMotion>{{OperationMode::CYCLIC_SYNC_POSITION, 0, MAX_STEP}});
+}
+}  // namespace
+
+TEST(CyclicControllerCsp, HoldsTheActualPositionUntilEnabled)
+{
+  Bench bench = csp_bench();
+  bench.actual_positions[0] = 123456;
+  bench.targets[0] = 0;  // a stale command must not be applied
+  bench.flags.enable_request = true;
+  for (int i = 0; i < 12; ++i)
+  {
+    bench.cycle();
+    EXPECT_EQ(bench.references[0], 123456) << "cycle " << i;
+  }
+  EXPECT_TRUE(bench.flags.operation_enabled.load());
+}
+
+TEST(CyclicControllerCsp, PositionStepIsLimited)
+{
+  Bench bench = csp_bench();
+  bench.actual_positions[0] = 1000;
+  bench.targets[0] = 1000;
+  bench.enable_and_wait();
+
+  bench.targets[0] = 1000 + 10 * MAX_STEP + 123;
+  std::vector<int32_t> refs;
+  for (int i = 0; i < 12; ++i)
+  {
+    bench.cycle();
+    refs.push_back(bench.references[0]);
+  }
+  EXPECT_EQ(refs[0], 1000 + MAX_STEP);
+  EXPECT_EQ(refs[9], 1000 + 10 * MAX_STEP);
+  EXPECT_EQ(refs[10], 1000 + 10 * MAX_STEP + 123);
+  EXPECT_EQ(refs[11], 1000 + 10 * MAX_STEP + 123);
+}
+
+TEST(CyclicControllerCsp, StartsFromTheActualPositionAfterEnable)
+{
+  Bench bench = csp_bench();
+  bench.actual_positions[0] = -50000;
+  bench.targets[0] = -49000;
+  bench.enable_and_wait();
+  bench.cycle();
+  EXPECT_EQ(bench.references[0], -50000 + MAX_STEP);
+}
+
+TEST(CyclicControllerCsp, ForceZeroHoldsPosition)
+{
+  Bench bench = csp_bench();
+  bench.actual_positions[0] = 777;
+  bench.targets[0] = 777;
+  bench.enable_and_wait();
+  bench.flags.force_zero = true;
+  bench.targets[0] = 999999;
+  bench.cycle();
+  EXPECT_EQ(bench.references[0], 777);
+}
+
+TEST(CyclicControllerCsp, MovesAcrossTheInt32Wrap)
+{
+  Bench bench = csp_bench();
+  bench.actual_positions[0] = INT32_MAX - 100;
+  bench.targets[0] = INT32_MAX - 100;
+  bench.enable_and_wait();
+  bench.targets[0] = INT32_MIN + 99;  // 200 ticks further, past the wrap
+  bench.cycle();
+  EXPECT_EQ(bench.references[0], INT32_MIN + 99);
+}
+
+TEST(CyclicControllerCst, TorqueFollowsTheCommandAndIsZeroWhenIdle)
+{
+  Bench bench(std::vector<DriveMotion>{{OperationMode::CYCLIC_SYNC_TORQUE}});
+  bench.targets[0] = 300;
+  bench.flags.enable_request = true;
+  bench.cycle();
+  EXPECT_EQ(bench.references[0], 0);
+  bench.enable_and_wait();
+  bench.cycle();
+  EXPECT_EQ(bench.references[0], 300);
+  bench.targets[0] = -250;  // reversing is applied at once
+  bench.cycle();
+  EXPECT_EQ(bench.references[0], -250);
+  bench.flags.force_zero = true;
+  bench.cycle();
+  EXPECT_EQ(bench.references[0], 0);
 }

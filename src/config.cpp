@@ -4,6 +4,9 @@
 
 #include "ird_ethercat_hardware_interface/config.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -64,10 +67,14 @@ const char * to_string(PdoRole role)
     case PdoRole::NONE: return "none";
     case PdoRole::CONTROLWORD: return "controlword";
     case PdoRole::MODE_OF_OPERATION: return "mode_of_operation";
+    case PdoRole::TARGET_POSITION: return "target_position";
     case PdoRole::TARGET_VELOCITY: return "target_velocity";
+    case PdoRole::TARGET_TORQUE: return "target_torque";
     case PdoRole::STATUSWORD: return "statusword";
     case PdoRole::MODE_DISPLAY: return "mode_display";
+    case PdoRole::POSITION_ACTUAL: return "position_actual";
     case PdoRole::VELOCITY_ACTUAL: return "velocity_actual";
+    case PdoRole::TORQUE_ACTUAL: return "torque_actual";
   }
   return "?";
 }
@@ -78,10 +85,14 @@ bool parse_pdo_role(const std::string & text, PdoRole & out)
       {"none", PdoRole::NONE},
       {"controlword", PdoRole::CONTROLWORD},
       {"mode_of_operation", PdoRole::MODE_OF_OPERATION},
+      {"target_position", PdoRole::TARGET_POSITION},
       {"target_velocity", PdoRole::TARGET_VELOCITY},
+      {"target_torque", PdoRole::TARGET_TORQUE},
       {"statusword", PdoRole::STATUSWORD},
       {"mode_display", PdoRole::MODE_DISPLAY},
-      {"velocity_actual", PdoRole::VELOCITY_ACTUAL}};
+      {"position_actual", PdoRole::POSITION_ACTUAL},
+      {"velocity_actual", PdoRole::VELOCITY_ACTUAL},
+      {"torque_actual", PdoRole::TORQUE_ACTUAL}};
   const auto it = names.find(text);
   if (it == names.end()) return false;
   out = it->second;
@@ -112,6 +123,17 @@ DriveConfig make_ird_csv_drive()
       {0x3024, 0x00, DataType::UINT32, "warning_code"},
   };
   return drive;
+}
+
+const char * command_interface_name(OperationMode mode)
+{
+  switch (mode)
+  {
+    case OperationMode::CYCLIC_SYNC_POSITION: return "position";
+    case OperationMode::CYCLIC_SYNC_VELOCITY: return "velocity";
+    case OperationMode::CYCLIC_SYNC_TORQUE: return "effort";
+  }
+  return "?";
 }
 
 uint32_t ms_to_cycles(uint32_t ms, uint32_t cycle_time_us)
@@ -147,9 +169,28 @@ void validate_pdo(
     errors.push_back(format("drive '%s': %s must have between 1 and 254 entries", drive.name.c_str(), which));
   }
 
+  const bool is_rx = std::string(which) == "RxPDO";
   std::map<PdoRole, int> count;
   for (const auto & entry : entries)
   {
+    if (entry.role == PdoRole::NONE && entry.interface.empty())
+    {
+      errors.push_back(format(
+          "drive '%s': %s entry 0x%04X:%02X has neither a role nor an interface name, so nothing would use it",
+          drive.name.c_str(), which, entry.index, entry.subindex));
+    }
+    if (is_rx && entry.role != PdoRole::NONE && !entry.interface.empty())
+    {
+      errors.push_back(format(
+          "drive '%s': RxPDO entry 0x%04X:%02X is written by the driver (role %s), so it cannot also be a "
+          "command interface", drive.name.c_str(), entry.index, entry.subindex, to_string(entry.role)));
+    }
+    if (!std::isfinite(entry.scale) || entry.scale == 0.0)
+    {
+      errors.push_back(format(
+          "drive '%s': %s entry 0x%04X:%02X: scale must be a non-zero number", drive.name.c_str(), which,
+          entry.index, entry.subindex));
+    }
     if (entry.role == PdoRole::NONE) continue;
     ++count[entry.role];
 
@@ -273,11 +314,6 @@ std::vector<std::string> validate(const SystemConfig & config)
     {
       errors.push_back(format("drive '%s': slave_position %d is used by another drive", name, drive.slave_position));
     }
-    if (drive.mode != OperationMode::CYCLIC_SYNC_VELOCITY)
-    {
-      errors.push_back(format(
-          "drive '%s': only mode CSV (9) is supported in this version (got %d)", name, static_cast<int>(drive.mode)));
-    }
     if (!(drive.encoder_ticks_per_rev > 0.0))
     {
       errors.push_back(format("drive '%s': encoder_ticks_per_rev must be > 0", name));
@@ -295,14 +331,80 @@ std::vector<std::string> validate(const SystemConfig & config)
       errors.push_back(format("drive '%s': enable_ramp_motor_rad_s2 must be >= 0", name));
     }
 
+    // ---- PDO roles: what each mode needs ----
+    // RxPDO: the controlword and the target of the selected mode (only that
+    // one: a target of another mode would never be written).
+    // TxPDO: the statusword, the actual value of the selected mode, and
+    // position or velocity (the joint states are derived from them).
+    std::vector<std::pair<PdoRole, DataType>> rx_required{{PdoRole::CONTROLWORD, DataType::UINT16}};
+    std::vector<std::pair<PdoRole, DataType>> tx_required{{PdoRole::STATUSWORD, DataType::UINT16}};
+    switch (drive.mode)
+    {
+      case OperationMode::CYCLIC_SYNC_POSITION:
+        rx_required.push_back({PdoRole::TARGET_POSITION, DataType::INT32});
+        tx_required.push_back({PdoRole::POSITION_ACTUAL, DataType::INT32});
+        break;
+      case OperationMode::CYCLIC_SYNC_VELOCITY:
+        rx_required.push_back({PdoRole::TARGET_VELOCITY, DataType::INT32});
+        tx_required.push_back({PdoRole::VELOCITY_ACTUAL, DataType::INT32});
+        break;
+      case OperationMode::CYCLIC_SYNC_TORQUE:
+        rx_required.push_back({PdoRole::TARGET_TORQUE, DataType::INT16});
+        break;
+    }
+    validate_pdo(drive, "RxPDO", drive.rx_pdo, rx_required, {{PdoRole::MODE_OF_OPERATION, DataType::INT8}}, errors);
     validate_pdo(
-        drive, "RxPDO", drive.rx_pdo,
-        {{PdoRole::CONTROLWORD, DataType::UINT16}, {PdoRole::TARGET_VELOCITY, DataType::INT32}},
-        {{PdoRole::MODE_OF_OPERATION, DataType::INT8}}, errors);
-    validate_pdo(
-        drive, "TxPDO", drive.tx_pdo,
-        {{PdoRole::STATUSWORD, DataType::UINT16}, {PdoRole::VELOCITY_ACTUAL, DataType::INT32}},
-        {{PdoRole::MODE_DISPLAY, DataType::INT8}}, errors);
+        drive, "TxPDO", drive.tx_pdo, tx_required,
+        {{PdoRole::MODE_DISPLAY, DataType::INT8}, {PdoRole::POSITION_ACTUAL, DataType::INT32},
+         {PdoRole::VELOCITY_ACTUAL, DataType::INT32}, {PdoRole::TORQUE_ACTUAL, DataType::INT16}},
+        errors);
+
+    auto has_role = [](const std::vector<PdoEntry> & entries, PdoRole role)
+    {
+      return std::any_of(entries.begin(), entries.end(), [role](const PdoEntry & e) { return e.role == role; });
+    };
+    if (!has_role(drive.tx_pdo, PdoRole::POSITION_ACTUAL) && !has_role(drive.tx_pdo, PdoRole::VELOCITY_ACTUAL))
+    {
+      errors.push_back(format(
+          "drive '%s': the TxPDO needs position_actual or velocity_actual to provide the joint states", name));
+    }
+    const bool uses_torque =
+        has_role(drive.rx_pdo, PdoRole::TARGET_TORQUE) || has_role(drive.tx_pdo, PdoRole::TORQUE_ACTUAL);
+    if (uses_torque && !(drive.rated_torque_nm > 0.0))
+    {
+      errors.push_back(format(
+          "drive '%s': rated_torque_nm must be > 0 when target_torque or torque_actual is mapped", name));
+    }
+
+    // ---- Interface names: <joint>/<interface> must be unique and valid ----
+    std::set<std::string> interfaces;
+    for (const auto * entries : {&drive.rx_pdo, &drive.tx_pdo})
+    {
+      for (const PdoEntry & entry : *entries)
+      {
+        if (entry.interface.empty()) continue;
+        const bool valid_chars = std::all_of(
+            entry.interface.begin(), entry.interface.end(),
+            [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; });
+        if (!valid_chars)
+        {
+          errors.push_back(format(
+              "drive '%s': interface name '%s' may only contain letters, digits and '_'", name,
+              entry.interface.c_str()));
+        }
+        if (entry.interface == "position" || entry.interface == "velocity" || entry.interface == "effort")
+        {
+          errors.push_back(format(
+              "drive '%s': interface name '%s' is reserved for the joint's standard interfaces", name,
+              entry.interface.c_str()));
+        }
+        else if (!interfaces.insert(entry.interface).second)
+        {
+          errors.push_back(format(
+              "drive '%s': interface name '%s' is used more than once", name, entry.interface.c_str()));
+        }
+      }
+    }
 
     for (const SdoWrite & sdo : drive.startup_sdos)
     {

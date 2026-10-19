@@ -122,6 +122,17 @@ TEST(ConfigLoader, MinimalExampleIsValid)
   EXPECT_EQ(config.bus.sync0_shift_us, 2000u);
 }
 
+TEST(ConfigLoader, OtherModesExampleIsValid)
+{
+  SystemConfig config;
+  const auto errors = load_config_file(CONFIG_DIR + "/other_modes_example.yaml", config);
+  ASSERT_TRUE(errors.empty()) << joined(errors);
+  EXPECT_TRUE(validate(config).empty()) << joined(validate(config));
+  ASSERT_EQ(config.drives.size(), 2u);
+  EXPECT_EQ(config.drives[0].mode, OperationMode::CYCLIC_SYNC_POSITION);
+  EXPECT_EQ(config.drives[1].mode, OperationMode::CYCLIC_SYNC_TORQUE);
+}
+
 TEST(ConfigLoader, PerDriveKeysOverrideDriveDefaults)
 {
   SystemConfig config;
@@ -285,4 +296,39 @@ TEST(ConfigLoader, LoadingResetsPreviousContent)
   SystemConfig config = naviwall_config();
   ASSERT_TRUE(load_config_string(BASE, config).empty());
   EXPECT_EQ(config.drives.size(), 1u);
+}
+
+TEST(ConfigLoader, ModesInterfacesAndScales)
+{
+  SystemConfig config;
+  const auto errors = load_config_string(R"(
+drive_defaults:
+  encoder_ticks_per_rev: 2048
+drives:
+  - name: arm
+    joint: arm_joint
+    slave_position: 1
+    mode: csp
+    rated_torque_nm: 0.8
+    rx_pdo:
+      entries:
+        - {object: "0x6040:00", type: uint16, role: controlword}
+        - {object: "0x607A:00", type: int32, role: target_position}
+        - {object: "0x2201:00", type: uint8, interface: digital_outputs}
+    tx_pdo:
+      entries:
+        - {object: "0x6041:00", type: uint16, role: statusword, interface: statusword}
+        - {object: "0x6064:00", type: int32, role: position_actual}
+        - {object: "0x6077:00", type: int16, role: torque_actual}
+        - {object: "0x6078:00", type: int16, interface: current_actual, scale: 0.001}
+)", config);
+  ASSERT_TRUE(errors.empty()) << joined(errors);
+  EXPECT_TRUE(validate(config).empty()) << joined(validate(config));
+  const DriveConfig & drive = config.drives[0];
+  EXPECT_EQ(drive.mode, OperationMode::CYCLIC_SYNC_POSITION);
+  EXPECT_DOUBLE_EQ(drive.rated_torque_nm, 0.8);
+  EXPECT_EQ(drive.rx_pdo[2].interface, "digital_outputs");
+  EXPECT_EQ(drive.tx_pdo[0].role, PdoRole::STATUSWORD);
+  EXPECT_EQ(drive.tx_pdo[0].interface, "statusword");
+  EXPECT_DOUBLE_EQ(drive.tx_pdo[3].scale, 0.001);
 }
