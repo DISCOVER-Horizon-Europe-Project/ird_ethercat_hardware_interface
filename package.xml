@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ird_ethercat_hardware_interface</name>
+  <version>0.1.0</version>
+  <description>
+    ros2_control hardware interface for Infranor IRD servo drives over EtherCAT (CiA 402, cyclic PDO,
+    distributed clocks), based on the SOEM EtherCAT master. Developed by CDEI-UPC (Centre de Disseny
+    d'Equips Industrials, Universitat Politecnica de Catalunya).
+  </description>
+  <maintainer email="yerayn2000@gmail.com">Yeray Navarro</maintainer>
+  <author>CDEI-UPC (Centre de Disseny d'Equips Industrials, Universitat Politecnica de Catalunya)</author>
+  <license>GPL-3.0-only</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- SOEM (https://github.com/OpenEtherCATsociety/SOEM, v2.x) has no rosdep key: it is either found
+       installed on the system or downloaded at build time. See README.md. -->
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

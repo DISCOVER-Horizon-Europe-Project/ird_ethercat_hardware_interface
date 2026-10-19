@@ -1,0 +1,10 @@
+<library path="ird_ethercat_hardware_interface">
+  <class name="ird_ethercat_hardware_interface/IrdEthercatSystem"
+         type="ird_ethercat_hardware_interface::IrdEthercatSystem"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      ros2_control system interface for Infranor IRD servo drives on an EtherCAT bus (SOEM master,
+      CiA 402 cyclic synchronous velocity, distributed clocks). Developed by CDEI-UPC.
+    </description>
+  </class>
+</library>
