@@ -27,14 +27,18 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <pthread.h>
+#include <sched.h>
 #include <set>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -57,7 +61,13 @@ constexpr int64_t DC_TARGET_PHASE_NS = 0;
 constexpr int32_t IRD_MIN_LEAD_US = 100;
 
 constexpr int DIAG_POLL_MS = 20;
-constexpr int ESC_COUNTERS_PERIOD_MS = 10'000;
+constexpr int ESC_COUNTERS_PERIOD_MS = 10'000;  // also the period of the DC sync difference check
+// Each drive's DC system time difference (0x092C) is logged at every fault,
+// once as a baseline, and every ESC_COUNTERS_PERIOD_MS when above this:
+// drives in sync stay well below a microsecond.
+constexpr int64_t DC_SYNC_DIFF_LOG_NS = 1000;
+constexpr uint32_t DC_SYNC_POLL_MS = 100;   // start-up cycles between two clock checks
+constexpr int64_t OP_REQUEST_REPEAT_US = 200'000;
 constexpr int32_t TIMING_LATE_WAKE_US = 200;  // marks a cycle as anomalous in the timing dump
 constexpr auto SAFE_STOP_DELAY = std::chrono::milliseconds(200);  // PDO disable before leaving OP
 constexpr auto THREAD_START_SETTLE = std::chrono::milliseconds(250);
@@ -262,7 +272,7 @@ bool IrdEthercatSystem::load_config()
     }
     for (const char * legacy : {"left_wheel_name", "right_wheel_name", "turret_name", "slave_left_motor",
                                 "slave_right_motor", "slave_turret_motor", "transmission_ratio_wheels",
-                                "transmission_ratio_turret", "encoder_ticks_per_rev"})
+                                "transmission_ratio_turret", "encoder_ticks_per_rev", "ethercat_rt_cpu"})
     {
       if (params.count(legacy))
       {
@@ -339,6 +349,15 @@ bool IrdEthercatSystem::load_config_from_urdf_params()
   };
 
   config_ = SystemConfig{};
+  // As in the original driver: the RT thread on the last CPU unless the
+  // optional parameter says otherwise (-1 = not pinned).
+  config_.bus.rt_cpu = -2;
+  const auto rt_cpu = info_.hardware_parameters.find("ethercat_rt_cpu");
+  if (rt_cpu != info_.hardware_parameters.end() && !rt_cpu->second.empty() &&
+      !get_int("ethercat_rt_cpu", config_.bus.rt_cpu))
+  {
+    return false;
+  }
   double ratio_wheels = 0.0;
   double ratio_turret = 0.0;
   int ticks_per_rev = 0;
@@ -456,22 +475,35 @@ bool IrdEthercatSystem::check_joints()
 void IrdEthercatSystem::log_pdo_layout(const Drive & drive) const
 {
   const DriveConfig & cfg = *drive.cfg;
+  // With several mapping objects, each one's entries start with [0xIIII].
   auto describe = [&](const char * which, uint16_t index, const std::vector<PdoEntry> & entries, const PdoLayout & layout)
   {
+    const std::vector<PdoObject> objects = split_into_pdos(entries, index, cfg.pdo_limits);
+    std::string indices;
     std::string text;
-    for (size_t i = 0; i < entries.size(); ++i)
+    for (const PdoObject & object : objects)
     {
-      const PdoEntry & e = entries[i];
       char item[160];
-      std::snprintf(
-          item, sizeof(item), "%s0x%04X:%02X %s @%zu", text.empty() ? "" : " | ", e.index, e.subindex,
-          to_string(e.type), layout.offsets[i]);
-      text += item;
-      if (e.role != PdoRole::NONE) text += std::string(" ") + to_string(e.role);
-      if (!e.interface.empty()) text += " -> " + cfg.joint + "/" + e.interface;
+      std::snprintf(item, sizeof(item), "%s0x%04X", indices.empty() ? "" : "+", object.index);
+      indices += item;
+      for (size_t i = object.first_entry; i < object.first_entry + object.entry_count; ++i)
+      {
+        const PdoEntry & e = entries[i];
+        char marker[16] = "";
+        if (objects.size() > 1 && i == object.first_entry)
+        {
+          std::snprintf(marker, sizeof(marker), "[0x%04X] ", object.index);
+        }
+        std::snprintf(
+            item, sizeof(item), "%s%s0x%04X:%02X %s @%zu", text.empty() ? "" : " | ", marker, e.index, e.subindex,
+            to_string(e.type), layout.offsets[i]);
+        text += item;
+        if (e.role != PdoRole::NONE) text += std::string(" ") + to_string(e.role);
+        if (!e.interface.empty()) text += " -> " + cfg.joint + "/" + e.interface;
+      }
     }
     RCLCPP_INFO(
-        logger_, "Drive '%s' %s 0x%04X (%zu bytes): %s", cfg.name.c_str(), which, index, layout.size_bytes,
+        logger_, "Drive '%s' %s %s (%zu bytes): %s", cfg.name.c_str(), which, indices.c_str(), layout.size_bytes,
         text.c_str());
   };
   describe("RxPDO", cfg.rx_pdo_index, cfg.rx_pdo, drive.rx_layout);
@@ -584,16 +616,19 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_activate(const rclcpp_l
 
   RCLCPP_INFO(logger_, "Requesting OPERATIONAL state...");
   master_->request_state(EC_STATE_OPERATIONAL);
-  if (!master_->wait_for_state(slave_positions(), EC_STATE_OPERATIONAL, static_cast<int64_t>(EC_TIMEOUTSTATE) * 4))
+  if (!master_->wait_for_state(
+          slave_positions(), EC_STATE_OPERATIONAL, static_cast<int64_t>(EC_TIMEOUTSTATE) * 4, OP_REQUEST_REPEAT_US))
   {
+    master_->read_states();  // the state check does not read the AL status code
     for (const auto & drive : drives_)
     {
       const int slave = drive->cfg->slave_position;
       if (master_->state(slave) != EC_STATE_OPERATIONAL)
       {
         RCLCPP_ERROR(
-            logger_, "Drive '%s' (slave %d) failed to reach OPERATIONAL. State=0x%02X, AL=0x%04X",
-            drive->cfg->name.c_str(), slave, master_->state(slave), master_->al_status_code(slave));
+            logger_, "Drive '%s' (slave %d) failed to reach OPERATIONAL. State=0x%02X, AL=0x%04X (%s)",
+            drive->cfg->name.c_str(), slave, master_->state(slave), master_->al_status_code(slave),
+            describe_al_status_code(master_->al_status_code(slave)));
       }
     }
     disable_drives_and_leave_op();
@@ -913,7 +948,8 @@ bool IrdEthercatSystem::init_ethercat()
   {
     const int64_t cycle_ns = static_cast<int64_t>(bus.cycle_time_us) * 1000;
     const int64_t shift_ns = static_cast<int64_t>(bus.sync0_shift_us) * 1000;
-    master_->configure_dc(slaves, cycle_ns, shift_ns);
+    setup_dc_clocks();
+    master_->start_sync0(slaves, cycle_ns, shift_ns);
     RCLCPP_INFO(
         logger_, "Configured DC SYNC0: cycle=%ld ns shift=%ld ns master_phase=%ld ns", static_cast<long>(cycle_ns),
         static_cast<long>(shift_ns), static_cast<long>(DC_TARGET_PHASE_NS));
@@ -968,6 +1004,10 @@ bool IrdEthercatSystem::init_ethercat()
   {
     RCLCPP_INFO(logger_, "Letting the EtherCAT network settle against DC clocks in SAFE-OP...");
     run_startup_cycles(ms_to_cycles(bus.startup_settle_ms, bus.cycle_time_us));
+    if (!wait_for_drive_clocks())
+    {
+      return fail();
+    }
   }
 
   // Report the sync mode each drive actually latched.
@@ -1028,6 +1068,104 @@ bool IrdEthercatSystem::init_ethercat()
 
   ec_initialized_ = true;
   return true;
+}
+
+// Sets up the distributed clocks and checks the result, redoing it if a
+// drive's clock was set wrong. Done in PRE-OP, before SYNC0 starts.
+void IrdEthercatSystem::setup_dc_clocks()
+{
+  for (uint32_t attempt = 1;; ++attempt)
+  {
+    master_->setup_dc_clocks();
+    if (dc_clock_setup_ok(attempt) || attempt >= config_.bus.dc_setup_attempts)
+    {
+      return;
+    }
+  }
+}
+
+// The clock setup sets each drive's clock from one latched local time and
+// ignores failed reads and writes, so a lost frame silently leaves a drive off
+// by however far the drives' free-running clocks are apart (0.5-1.7 s on the
+// Naviwall robot, refusing 3 of 11 starts). Right after it, every drive's
+// system time minus the host clock must agree within dc_setup_tolerance_us.
+// Also logs what the setup wrote (offset, propagation delay).
+bool IrdEthercatSystem::dc_clock_setup_ok(uint32_t attempt)
+{
+  const BusConfig & bus = config_.bus;
+  std::string line;
+  bool reads_ok = true;
+  int64_t lowest = LLONG_MAX;
+  int64_t highest = LLONG_MIN;
+  for (const auto & drive : drives_)
+  {
+    const int slave = drive->cfg->slave_position;
+    char item[160];
+    int64_t delta_ns = 0;
+    int64_t offset_ns = 0;
+    if (!master_->dc_time_minus_host(slave, delta_ns))
+    {
+      std::snprintf(item, sizeof(item), " %s read failed;", drive->cfg->name.c_str());
+      line += item;
+      reads_ok = false;
+      continue;
+    }
+    const bool offset_ok = master_->dc_system_time_offset(slave, offset_ns);
+    lowest = std::min(lowest, delta_ns);
+    highest = std::max(highest, delta_ns);
+    std::snprintf(
+        item, sizeof(item), " %s %+lld us (offset %s%+lld ms, pdelay %d ns, entry port %d);", drive->cfg->name.c_str(),
+        static_cast<long long>(delta_ns / 1000), offset_ok ? "" : "read failed ",
+        offset_ok ? static_cast<long long>(offset_ns / 1'000'000) : 0LL, master_->propagation_delay_ns(slave),
+        master_->entry_port(slave));
+    line += item;
+  }
+
+  const bool ok = reads_ok && highest - lowest <= static_cast<int64_t>(bus.dc_setup_tolerance_us) * 1000;
+  if (ok)
+  {
+    RCLCPP_INFO(logger_, "DC clock setup (attempt %u), drive time minus host time:%s", attempt, line.c_str());
+  }
+  else
+  {
+    RCLCPP_WARN(
+        logger_, "DC clock setup (attempt %u) left the drives apart (spread %lld us), %s:%s", attempt,
+        reads_ok ? static_cast<long long>((highest - lowest) / 1000) : -1LL,
+        attempt < bus.dc_setup_attempts ? "redoing it" : "continuing; the clock check in SAFE-OP decides",
+        line.c_str());
+  }
+  return ok;
+}
+
+// The settle locks the frame phase to the reference clock only; the other
+// drives follow it through their own DC loops. Keep cycling in SAFE-OP (the
+// cycles carry the drift compensation) until every drive is within
+// dc_sync_tolerance_ns of the reference clock, or give up so that nothing is
+// enabled: a drive left seconds off makes SYNC0 drift through the frame
+// (error 50 every few seconds). Good starts read a few hundred ns at most.
+bool IrdEthercatSystem::wait_for_drive_clocks()
+{
+  const BusConfig & bus = config_.bus;
+  const uint32_t poll_cycles = ms_to_cycles(DC_SYNC_POLL_MS, bus.cycle_time_us);
+  std::string line;
+  for (uint32_t waited_ms = 0;; waited_ms += DC_SYNC_POLL_MS)
+  {
+    if (dc_sync_differences(line) <= static_cast<int64_t>(bus.dc_sync_tolerance_ns))
+    {
+      RCLCPP_INFO(logger_, "Drive clocks synchronised to the reference clock:%s", line.c_str());
+      return true;
+    }
+    if (waited_ms >= bus.dc_sync_timeout_ms)
+    {
+      RCLCPP_ERROR(
+          logger_,
+          "Drive clocks NOT synchronised to the reference clock after %u ms:%s Not enabling the drives: restart "
+          "(power-cycle the drives if it repeats).", bus.dc_sync_timeout_ms, line.c_str());
+      log_esc_error_counters(true);  // lost or corrupted frames on the chain show up here
+      return false;
+    }
+    run_startup_cycles(poll_cycles);
+  }
 }
 
 // A drive can still hold a fault from a previous session (e.g. one killed
@@ -1371,6 +1509,32 @@ void IrdEthercatSystem::processdata_loop()
         sched.sched_priority, std::strerror(sched_rc));
   }
 
+  // Unpinned, the thread can be held between waking and sending by
+  // higher-priority RT threads on the same core (on the Naviwall robot a UR
+  // driver at priority 99 held it ~2.5 ms: the frame reached the drives after
+  // SYNC0, error 50). Pinning alone does not keep other threads off the core.
+  const long n_cpus = sysconf(_SC_NPROCESSORS_CONF);
+  const int rt_cpu = bus.rt_cpu == -2 ? static_cast<int>(n_cpus - 1) : bus.rt_cpu;
+  if (rt_cpu >= 0 && rt_cpu < n_cpus)
+  {
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    CPU_SET(rt_cpu, &cpus);
+    const int affinity_rc = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+    if (affinity_rc == 0)
+    {
+      RCLCPP_INFO(logger_, "Processdata thread pinned to CPU %d.", rt_cpu);
+    }
+    else
+    {
+      RCLCPP_WARN(logger_, "Processdata thread could not be pinned to CPU %d: %s", rt_cpu, std::strerror(affinity_rc));
+    }
+  }
+  else if (rt_cpu >= 0)
+  {
+    RCLCPP_WARN(logger_, "rt_cpu=%d but this machine has %ld CPUs; processdata thread left unpinned.", rt_cpu, n_cpus);
+  }
+
   ec_timet ts = next_whole_ms();
   while (!processdata_thread_stop_.load())
   {
@@ -1401,7 +1565,8 @@ void IrdEthercatSystem::processdata_loop()
     // ---- 3. Exchange the frame, DC lock and timing history ----
     ec_timet exchange_start;
     osal_get_monotonic_time(&exchange_start);
-    const int recv_wkc = master_->exchange();
+    ec_timet sent_at = exchange_start;
+    const int recv_wkc = master_->exchange(&sent_at);
     ec_timet exchange_end;
     osal_get_monotonic_time(&exchange_end);
     last_processdata_wkc_.store(recv_wkc);
@@ -1437,11 +1602,13 @@ void IrdEthercatSystem::processdata_loop()
       CycleTiming & sample = timing_history_[timing_history_next_];
       timing_history_next_ = (timing_history_next_ + 1) % TIMING_HISTORY_CYCLES;
       sample.wake_late_us = static_cast<int32_t>(ns_between(ts, woke) / 1000);
+      sample.send_us = static_cast<int32_t>(ns_between(exchange_start, sent_at) / 1000);
       sample.exchange_us = static_cast<int32_t>(ns_between(exchange_start, exchange_end) / 1000);
       sample.dc_phase_us = phase_us;
       sample.toff_us = static_cast<int32_t>(toff / 1000);
       sample.toff_i_us = static_cast<int32_t>(toff_integral / 1000);
       sample.wkc = static_cast<int16_t>(recv_wkc);
+      sample.cpu = static_cast<int16_t>(sched_getcpu());
     }
 
     // ---- 4. Publish inputs ----
@@ -1553,6 +1720,7 @@ void IrdEthercatSystem::diagnostics_loop()
   pthread_setschedparam(pthread_self(), SCHED_OTHER, &sched);
 
   int since_counters_ms = 0;
+  bool dc_baseline_logged = false;
   while (!diagnostics_thread_stop_.load())
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(DIAG_POLL_MS));
@@ -1570,6 +1738,7 @@ void IrdEthercatSystem::diagnostics_loop()
         }
       }
       log_esc_error_counters(true);
+      if (config_.bus.distributed_clocks) log_dc_sync_differences(true);
       since_counters_ms = 0;
     }
 
@@ -1578,6 +1747,11 @@ void IrdEthercatSystem::diagnostics_loop()
     {
       since_counters_ms = 0;
       log_esc_error_counters(false);
+      if (config_.bus.distributed_clocks)
+      {
+        log_dc_sync_differences(!dc_baseline_logged);  // the first one as a baseline
+        dc_baseline_logged = true;
+      }
     }
   }
 }
@@ -1671,6 +1845,46 @@ void IrdEthercatSystem::log_esc_error_counters(bool force)
   }
 }
 
+// Each drive's DC system time difference to the reference clock (0x092C),
+// as " name +N ns;" items. Returns the largest magnitude (LLONG_MAX if a read
+// failed).
+int64_t IrdEthercatSystem::dc_sync_differences(std::string & line)
+{
+  line.clear();
+  int64_t worst_ns = 0;
+  for (const auto & drive : drives_)
+  {
+    char item[96];
+    int64_t difference_ns = 0;
+    if (master_->dc_sync_difference(drive->cfg->slave_position, difference_ns))
+    {
+      worst_ns = std::max(worst_ns, std::abs(difference_ns));
+      std::snprintf(item, sizeof(item), " %s %+lld ns;", drive->cfg->name.c_str(), static_cast<long long>(difference_ns));
+    }
+    else
+    {
+      worst_ns = LLONG_MAX;
+      std::snprintf(item, sizeof(item), " %s read failed;", drive->cfg->name.c_str());
+    }
+    line += item;
+  }
+  return worst_ns;
+}
+
+void IrdEthercatSystem::log_dc_sync_differences(bool force)
+{
+  std::string line;
+  const bool above = dc_sync_differences(line) > DC_SYNC_DIFF_LOG_NS;
+  if (above)
+  {
+    RCLCPP_WARN(logger_, "DC sync difference to the reference clock:%s", line.c_str());
+  }
+  else if (force)
+  {
+    RCLCPP_INFO(logger_, "DC sync difference to the reference clock:%s", line.c_str());
+  }
+}
+
 void IrdEthercatSystem::log_timing_diagnostics()
 {
   if (!timing_dump_ready_.load(std::memory_order_acquire)) return;
@@ -1693,13 +1907,19 @@ void IrdEthercatSystem::log_timing_diagnostics()
   for (size_t i = 0; i < TIMING_HISTORY_CYCLES; ++i)
   {
     const CycleTiming & c = timing_dump_[i];
+    // A large send time with an on-time wake-up: the thread was held before
+    // the frame went out (CPU contention). A small send time but a late DC
+    // phase: the frame was delayed after it was handed to the kernel (NIC).
     const bool anomalous = c.wkc < expected_wkc || c.wake_late_us > TIMING_LATE_WAKE_US ||
-                           std::abs(c.dc_phase_us) > phase_limit_us || c.exchange_us > 1000;
+                           c.send_us > TIMING_LATE_WAKE_US || std::abs(c.dc_phase_us) > phase_limit_us ||
+                           c.exchange_us > 1000;
     if (!anomalous && i + TAIL < TIMING_HISTORY_CYCLES) continue;
     RCLCPP_WARN(
-        logger_, "  cycle %4d: wake late %5d us, exchange %5d us, DC phase %5d us, toff %4d us (I %4d), WKC %d%s",
-        static_cast<int>(i) - static_cast<int>(TIMING_HISTORY_CYCLES), c.wake_late_us, c.exchange_us,
-        c.dc_phase_us, c.toff_us, c.toff_i_us, c.wkc, anomalous ? "  <--" : "");
+        logger_,
+        "  cycle %4d: wake late %5d us, send %5d us, exchange %5d us, DC phase %5d us, toff %4d us (I %4d), WKC %d, "
+        "CPU %d%s",
+        static_cast<int>(i) - static_cast<int>(TIMING_HISTORY_CYCLES), c.wake_late_us, c.send_us, c.exchange_us,
+        c.dc_phase_us, c.toff_us, c.toff_i_us, c.wkc, c.cpu, anomalous ? "  <--" : "");
   }
   timing_dump_ready_.store(false, std::memory_order_release);
 }

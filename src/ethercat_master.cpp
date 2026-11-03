@@ -7,6 +7,7 @@
 #include <chrono>
 
 #include "rclcpp/logging.hpp"
+#include "ird_ethercat_hardware_interface/dc_sync.hpp"
 #include "ird_ethercat_hardware_interface/pdo.hpp"
 #include "ird_ethercat_hardware_interface/startup_plan.hpp"
 
@@ -181,9 +182,13 @@ bool EthercatMaster::map_process_data()
   return true;
 }
 
-void EthercatMaster::configure_dc(const std::vector<int> & slaves, int64_t cycle_ns, int64_t shift_ns)
+void EthercatMaster::setup_dc_clocks()
 {
   ecx_configdc(&ctx_);
+}
+
+void EthercatMaster::start_sync0(const std::vector<int> & slaves, int64_t cycle_ns, int64_t shift_ns)
+{
   for (int slave : slaves)
   {
     ecx_dcsync0(&ctx_, slave, TRUE, cycle_ns, shift_ns);
@@ -194,10 +199,14 @@ void EthercatMaster::configure_dc(const std::vector<int> & slaves, int64_t cycle
 // Process data and states
 // =========================================================================
 
-int EthercatMaster::exchange()
+int EthercatMaster::exchange(ec_timet * sent_at)
 {
   std::lock_guard<std::mutex> guard(bus_mutex_);
   ecx_send_processdata_group(&ctx_, 0);
+  if (sent_at)
+  {
+    osal_get_monotonic_time(sent_at);
+  }
   return ecx_receive_processdata_group(&ctx_, 0, EC_TIMEOUTRET);
 }
 
@@ -208,9 +217,12 @@ void EthercatMaster::request_state(uint16_t state)
   ecx_writestate(&ctx_, 0);
 }
 
-bool EthercatMaster::wait_for_state(const std::vector<int> & slaves, uint16_t state, int64_t timeout_us)
+bool EthercatMaster::wait_for_state(
+    const std::vector<int> & slaves, uint16_t state, int64_t timeout_us, int64_t repeat_request_us)
 {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout_us);
+  const auto start = std::chrono::steady_clock::now();
+  const auto deadline = start + std::chrono::microseconds(timeout_us);
+  auto last_request = start;
   while (true)
   {
     bool all_reached = true;
@@ -220,16 +232,34 @@ bool EthercatMaster::wait_for_state(const std::vector<int> & slaves, uint16_t st
         std::lock_guard<std::mutex> guard(bus_mutex_);
         ecx_statecheck(&ctx_, slave, state, 0);
       }
-      if (ctx_.slavelist[slave].state != state)
-      {
-        all_reached = false;
-        break;
-      }
+      all_reached = all_reached && ctx_.slavelist[slave].state == state;
     }
     if (all_reached) return true;
-    if (std::chrono::steady_clock::now() > deadline) return false;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now > deadline) return false;
+    // The request is a single broadcast: a drive that missed it stays where
+    // it is without any error. Repeat it to those not there yet, as SOEM's
+    // examples do.
+    if (repeat_request_us > 0 && now - last_request >= std::chrono::microseconds(repeat_request_us))
+    {
+      last_request = now;
+      std::lock_guard<std::mutex> guard(bus_mutex_);
+      for (int slave : slaves)
+      {
+        if (ctx_.slavelist[slave].state == state) continue;
+        ctx_.slavelist[slave].state = state;
+        ecx_writestate(&ctx_, slave);
+      }
+    }
     osal_usleep(STATE_POLL_US);
   }
+}
+
+void EthercatMaster::read_states()
+{
+  std::lock_guard<std::mutex> guard(bus_mutex_);
+  ecx_readstate(&ctx_);
 }
 
 // =========================================================================
@@ -317,6 +347,37 @@ void EthercatMaster::log_dc_snapshot(int slave)
       wkc_start0 > 0 ? "" : "FAIL(", wkc_start0 > 0 ? static_cast<unsigned long long>(start0) : 0ULL,
       wkc_start0 > 0 ? "" : ")",
       wkc_cycle0 > 0 ? "" : "FAIL(", wkc_cycle0 > 0 ? cycle0 : 0U, wkc_cycle0 > 0 ? "" : ")");
+}
+
+bool EthercatMaster::dc_time_minus_host(int slave, int64_t & delta_ns)
+{
+  uint64_t system_time = 0;
+  const ec_timet host = osal_current_time();
+  const uint16_t configadr = ctx_.slavelist[slave].configadr;
+  if (ecx_FPRD(&ctx_.port, configadr, ECT_REG_DCSYSTIME, sizeof(system_time), &system_time, EC_TIMEOUTRET) <= 0)
+  {
+    return false;
+  }
+  delta_ns = static_cast<int64_t>(system_time) - to_ethercat_time_ns(host.tv_sec, host.tv_nsec);
+  return true;
+}
+
+bool EthercatMaster::dc_system_time_offset(int slave, int64_t & offset_ns)
+{
+  const uint16_t configadr = ctx_.slavelist[slave].configadr;
+  return ecx_FPRD(&ctx_.port, configadr, ECT_REG_DCSYSOFFSET, sizeof(offset_ns), &offset_ns, EC_TIMEOUTRET) > 0;
+}
+
+bool EthercatMaster::dc_sync_difference(int slave, int64_t & difference_ns)
+{
+  uint32_t reg = 0;
+  const uint16_t configadr = ctx_.slavelist[slave].configadr;
+  if (ecx_FPRD(&ctx_.port, configadr, ECT_REG_DCSYSDIFF, sizeof(reg), &reg, EC_TIMEOUTRET) <= 0)
+  {
+    return false;
+  }
+  difference_ns = decode_dc_sync_difference(reg);
+  return true;
 }
 
 }  // namespace ird_ethercat_hardware_interface

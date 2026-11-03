@@ -173,6 +173,32 @@ TEST(Config, BusLimitsAreChecked)
   EXPECT_TRUE(contains(errors, "rt_priority"));
 }
 
+TEST(Config, DcChecksAndCpuAreChecked)
+{
+  SystemConfig config = naviwall_config();
+  config.bus.rt_cpu = -3;
+  config.bus.dc_setup_attempts = 0;
+  const auto errors = validate(config);
+  EXPECT_TRUE(contains(errors, "rt_cpu"));
+  EXPECT_TRUE(contains(errors, "dc_setup_attempts"));
+}
+
+TEST(Config, MappingMustFitInTheDrivesPdos)
+{
+  SystemConfig config = naviwall_config();
+  DriveConfig & drive = config.drives[0];
+  drive.tx_pdo.push_back({0x6064, 0, DataType::INT32, PdoRole::POSITION_ACTUAL});
+  drive.tx_pdo.push_back({0x6078, 0, DataType::INT16, PdoRole::NONE, "current_actual", 0.001});
+  drive.tx_pdo.push_back({0x6079, 0, DataType::UINT32, PdoRole::NONE, "dc_link_voltage", 0.001});
+  EXPECT_TRUE(validate(config).empty());  // three 8-byte PDOs of four
+
+  drive.pdo_limits.max_pdos = 2;
+  EXPECT_TRUE(contains(validate(config), "the TxPDO needs 3 mapping objects (0x1A00..0x1A02)"));
+
+  drive.pdo_limits = {2, 0, 0};
+  EXPECT_TRUE(contains(validate(config), "(4 bytes) is larger than pdo_limits.max_bytes (2)"));
+}
+
 TEST(Config, StartupSdoValueMustFitItsType)
 {
   SystemConfig config = naviwall_config();

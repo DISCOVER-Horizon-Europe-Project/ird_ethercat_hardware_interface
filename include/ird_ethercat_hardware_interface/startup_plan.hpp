@@ -29,7 +29,9 @@ constexpr int64_t IRD_SYNC_TYPE_HARD = 4;
 /// Order:
 ///  1. the drive's own startup_sdos from the configuration,
 ///  2. PDO mapping: clear the assignments (0x1C12/0x1C13) and mapping
-///     objects, write each entry and the entry count, assign again,
+///     objects, write each entry and the entry count, assign again. The
+///     entries are split over several mapping objects when the drive's
+///     pdo_limits require it (split_into_pdos),
 ///  3. synchronisation objects (0x1006, 0x2012), which the IRD latches at
 ///     the PRE-OP -> SAFE-OP transition, so they must be written now.
 std::vector<SdoWrite> build_startup_plan(const DriveConfig & drive, const BusConfig & bus);

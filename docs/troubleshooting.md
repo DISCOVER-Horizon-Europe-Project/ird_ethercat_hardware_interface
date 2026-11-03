@@ -36,6 +36,7 @@ These are reported before anything is sent to the drives.
 | `Configuration error: drive 'x': the RxPDO/TxPDO needs an entry with role ...` | A role required by the drive's mode is missing from the PDO mapping. See [roles](configuration.md#pdo-mapping). |
 | `Configuration error: ... has neither a role nor an interface name` | A mapped object would not be used: give it a `role` or an `interface`, or remove it. |
 | `Configuration error: ... used more than once` | Duplicate drive name, joint, slave position or interface name. |
+| `Configuration error: drive 'x': the TxPDO needs N mapping objects (0x1A00..0x1A0n) ... but the drive accepts at most M (pdo_limits)` | The mapping is too long for the drive's PDOs (an IRD PDO holds 8 bytes / 4 objects, and there are 4). Map fewer objects. See [limits of the drive](configuration.md#limits-of-the-drive). |
 | `Joint 'j' of drive 'x' is not declared in this <ros2_control> block.` | Add a `<joint name="j">` to the `<ros2_control>` block of the URDF. |
 | `Joint 'j' is declared in the <ros2_control> block but no drive drives it.` | Remove the joint from the block, or add a drive for it in the configuration. |
 | `Joint 'j' must declare the command interface 'velocity'` / `... has no command/state interface '...' (available: ...)` | The joint's interfaces in the URDF do not match the drive's mode or mapping. The message lists what is available. |
@@ -49,6 +50,7 @@ These are reported before anything is sent to the drives.
 | `ros2_control_node: error while loading shared libraries: ... cannot open shared object file` | The executable has capabilities, so `LD_LIBRARY_PATH` is ignored. Register the library directories in `/etc/ld.so.conf.d/` as described in [step 3](getting_started.md#3-give-ros2_control-the-permissions-it-needs). |
 | `Processdata thread could not enable SCHED_FIFO priority 80: Operation not permitted` | Warning: missing `cap_sys_nice`. The thread runs without real-time priority, so timing faults (error 49/50) become likely. |
 | `mlockall failed (...)` | Warning: missing `cap_ipc_lock` (or a low `ulimit -l`). Page faults can delay the real-time thread. |
+| `Processdata thread could not be pinned to CPU N: ...` / `rt_cpu=N but this machine has M CPUs; ...` | Warning: `bus.rt_cpu` names a CPU the process may not use (e.g. excluded by a cgroup or `taskset`) or that does not exist. The thread runs unpinned. |
 
 After a ROS update, re-run `setcap`: the update replaces the executable and its capabilities.
 
@@ -105,13 +107,15 @@ power. A write marked `required: false` only produces a warning
 | `Slave N does not report distributed clocks capability.` | The device does not support DC: set `bus.distributed_clocks: false` (not recommended for IRD drives) or check that the right device is at that position. |
 | `Slave N fell back to SoftSync (0x2012:01=2, ...). HardSync was requested in PRE-OP but did not latch at the PS transition.` | Warning: the drive runs in SoftSync although HardSync was configured. It still works, with looser synchronisation. Report it with the full startup log. |
 | `Slave N sync settings unexpected (observed 0x1006:00=..., 0x2012:01=...)` | Warning: the drive reports a cycle period or sync mode different from the configuration. |
+| `DC clock setup (attempt 1) left the drives apart (spread X us), redoing it: ...` | Warning: the drives' clocks were not set consistently, usually because a frame was lost during the setup. It is redone automatically; a success on the next attempt needs no action. If it happens often, check the cabling (ESC error counters) and the EtherCAT port. |
+| `Drive clocks NOT synchronised to the reference clock after 2000 ms: ... Not enabling the drives` | A drive's clock did not follow the reference drive (the values per drive are in the message), so nothing was enabled: it would fault with error 50 every few seconds. Restart; if it repeats, power-cycle the drives and look at the ESC error counters logged right after. |
 | `DC phase not settled within 3000 ms (frame at X us, SYNC0 at Y us); continuing, an error 50 right after enable is possible.` | Warning: the master's timing did not stabilise. Usually caused by the PC (no real-time priority, heavy load) or by traffic on the EtherCAT port. See the checklist [below](#runtime-fault-error-49-or-50). |
 
 ## 6. OPERATIONAL and enabling
 
 | Message | Cause and fix |
 |---|---|
-| `Drive 'x' (slave N) failed to reach OPERATIONAL. State=0x.., AL=0x....` | See the [AL status code](#al-status-codes). Codes 0x001A/0x002C or 0x0030–0x0036 point to synchronisation problems, 0x001B to missing process data. |
+| `Drive 'x' (slave N) failed to reach OPERATIONAL. State=0x.., AL=0x.... (meaning)` | The request is repeated every 200 ms, so this is not a missed request. See the [AL status code](#al-status-codes). Codes 0x001A/0x002C or 0x0030–0x0036 point to synchronisation problems, 0x001B to missing process data. |
 | `Drive 'x' (slave N) starts activation in FAULT (SW=0x....). Clearing latched fault via SDO reset.` followed by `fault latched before activation ...` | Warning, normal after a session that was killed without a clean shutdown (e.g. a crash or `kill -9`): the drives latched error 49/50 when the frames stopped. The fault is reset automatically. |
 | `Drive 'x' (slave N): fault reset did not clear FAULT (SW=0x....).` | The drive has a real fault that a reset cannot clear (the fault snapshot in the same log says which). Fix its cause (power stage, motor, encoder, limits...), using Optio if needed. |
 | `Aborting PDO enable sequence after repeated drive faults. Last TPDO statuswords: ...` | A drive went to FAULT while being enabled. The fault snapshots that follow give the error code. |
@@ -123,7 +127,7 @@ power. A write marked `required: false` only produces a warning
 Runtime drive fault detected (SW left=0x0218 right=0x0237 turret=0x0237). Auto-recovery attempt 1/5 after cooldown.
 Drive 'left' (slave 1) fault snapshot: SW=0x0218  AL=0x0000 (no AL error)  error_code(0x603F:00)=0x8782 (fieldbus IP reference underflow/overflow (error 50: ...)) ...
 EtherCAT timing before the fault (last 128 cycles, ...):
-  cycle  -12: wake late   830 us, exchange   95 us, DC phase  1990 us, ...  <--
+  cycle  -12: wake late   830 us, send    15 us, exchange   95 us, DC phase  1990 us, ...  <--
 Drives recovered from runtime fault: Operation Enabled restored; ...
 ```
 
@@ -142,7 +146,8 @@ is harmless. Frequent ones mean the timing has to be improved.
 
 | What the marked lines show | Cause | Fix |
 |---|---|---|
-| `wake late` of hundreds of µs | The PC woke the real-time thread late | PREEMPT_RT kernel; check `SCHED_FIFO` and `mlockall` warnings; isolate a CPU core; reduce CPU load |
+| `wake late` of hundreds of µs | The PC woke the real-time thread late | PREEMPT_RT kernel; check `SCHED_FIFO` and `mlockall` warnings; reserve a CPU and set `bus.rt_cpu` (and keep that CPU out of deep idle states); reduce CPU load |
+| `send` of hundreds of µs, `wake late` small | The thread was held between waking and sending by a higher-priority thread on its CPU | Reserve a CPU for the thread and set `bus.rt_cpu` (see [How it works](how_it_works.md#4-synchronisation)) |
 | `exchange` long, `wake late` small | The frame was delayed on the network side | Use a dedicated port for EtherCAT; disable interrupt coalescing on it (`ethtool -C eno1 rx-usecs 0`); disable energy-saving features of the NIC |
 | `DC phase` close to or past `sync0_shift_us`, both above small | Frames arrive late in the cycle | Increase `bus.sync0_shift_us` (up to half the cycle) |
 | `WKC` below the expected value | A frame was lost | Check cables and connectors; look at the ESC error counters (below) |
@@ -172,6 +177,7 @@ soft_sync` tolerates more jitter (with looser synchronisation).
 | `Drive 'x' received a non-finite ... command (nan); ...` | A controller wrote NaN or infinity. It is replaced by 0 (csv, cst) or by the current position (csp). |
 | `read(): WKC below expectation: got A expected at least B` | Frames come back with fewer drives having processed them: a drive left OPERATIONAL or a link is intermittent. Check the cabling and the drives' state. |
 | `Drive 'x' (slave N) ESC error counters: ...` | Logged when a drive's EtherCAT error counters change (see above). A single change after power-on is normal; steadily increasing values are not. |
+| `DC sync difference to the reference clock: ...` | Each drive's clock difference to the reference drive. Logged once as a baseline (info), with every fault, and as a warning whenever a drive is more than 1 µs off. A drive that stays off by microseconds or more loses synchronisation: expect error 50 on it. |
 | `Not all drives confirmed SAFE-OP before stopping the process data.` | Warning at shutdown: a drive did not confirm SAFE-OP in time. It may report error 49/50 at the next start, which is then cleared automatically. |
 
 ## 9. Reference tables

@@ -52,6 +52,11 @@ void expect_same(const SystemConfig & a, const SystemConfig & b)
   EXPECT_EQ(a.bus.dc_lock_ms, b.bus.dc_lock_ms);
   EXPECT_EQ(a.bus.dc_lock_timeout_ms, b.bus.dc_lock_timeout_ms);
   EXPECT_EQ(a.bus.startup_settle_ms, b.bus.startup_settle_ms);
+  EXPECT_EQ(a.bus.rt_cpu, b.bus.rt_cpu);
+  EXPECT_EQ(a.bus.dc_setup_tolerance_us, b.bus.dc_setup_tolerance_us);
+  EXPECT_EQ(a.bus.dc_setup_attempts, b.bus.dc_setup_attempts);
+  EXPECT_EQ(a.bus.dc_sync_tolerance_ns, b.bus.dc_sync_tolerance_ns);
+  EXPECT_EQ(a.bus.dc_sync_timeout_ms, b.bus.dc_sync_timeout_ms);
 
   EXPECT_EQ(a.faults.enable_timeout_ms, b.faults.enable_timeout_ms);
   EXPECT_EQ(a.faults.enable_stable_ms, b.faults.enable_stable_ms);
@@ -81,6 +86,9 @@ void expect_same(const SystemConfig & a, const SystemConfig & b)
     EXPECT_EQ(x.tx_pdo_index, y.tx_pdo_index);
     expect_same_entries(x.rx_pdo, y.rx_pdo);
     expect_same_entries(x.tx_pdo, y.tx_pdo);
+    EXPECT_EQ(x.pdo_limits.max_bytes, y.pdo_limits.max_bytes);
+    EXPECT_EQ(x.pdo_limits.max_entries, y.pdo_limits.max_entries);
+    EXPECT_EQ(x.pdo_limits.max_pdos, y.pdo_limits.max_pdos);
     ASSERT_EQ(x.startup_sdos.size(), y.startup_sdos.size());
     ASSERT_EQ(x.fault_snapshot.size(), y.fault_snapshot.size());
     for (size_t k = 0; k < x.fault_snapshot.size(); ++k)
@@ -176,6 +184,41 @@ drives:
   EXPECT_EQ(drive.tx_pdo[2].index, 0x6077);
   EXPECT_EQ(drive.tx_pdo[2].role, PdoRole::NONE);
   EXPECT_EQ(drive.rx_pdo.size(), 3u);  // untouched default
+}
+
+TEST(ConfigLoader, ClockChecksCpuAndPdoLimits)
+{
+  SystemConfig config;
+  const auto errors = load_config_string(R"(
+bus:
+  rt_cpu: -2
+  dc_setup_tolerance_us: 500
+  dc_setup_attempts: 5
+  dc_sync_tolerance_ns: 2000
+  dc_sync_timeout_ms: 3000
+drive_defaults:
+  encoder_ticks_per_rev: 2048
+  pdo_limits: {max_bytes: 0, max_entries: 8, max_pdos: 1}
+drives:
+  - {name: a, joint: ja, slave_position: 1}
+)", config);
+  ASSERT_TRUE(errors.empty()) << joined(errors);
+  EXPECT_EQ(config.bus.rt_cpu, -2);
+  EXPECT_EQ(config.bus.dc_setup_tolerance_us, 500u);
+  EXPECT_EQ(config.bus.dc_setup_attempts, 5u);
+  EXPECT_EQ(config.bus.dc_sync_tolerance_ns, 2000u);
+  EXPECT_EQ(config.bus.dc_sync_timeout_ms, 3000u);
+  EXPECT_EQ(config.drives[0].pdo_limits.max_bytes, 0u);
+  EXPECT_EQ(config.drives[0].pdo_limits.max_entries, 8u);
+  EXPECT_EQ(config.drives[0].pdo_limits.max_pdos, 1u);
+
+  const auto bad = load_config_string(R"(
+drive_defaults:
+  pdo_limits: {max_byte: 8}
+drives:
+  - {name: a, joint: ja, slave_position: 1}
+)", config);
+  EXPECT_TRUE(contains(bad, "drive_defaults.pdo_limits: unknown key 'max_byte'"));
 }
 
 TEST(ConfigLoader, StartupSdosAndHexValues)

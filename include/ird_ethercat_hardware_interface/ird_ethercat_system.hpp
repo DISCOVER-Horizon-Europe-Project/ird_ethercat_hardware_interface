@@ -150,11 +150,13 @@ private:
   struct CycleTiming
   {
     int32_t wake_late_us{0};  ///< wake-up after the absolute cycle deadline
+    int32_t send_us{0};       ///< exchange start until the frame was handed to the kernel (incl. lock wait)
     int32_t exchange_us{0};   ///< send + receive of the process-data frame
     int32_t dc_phase_us{0};   ///< frame's DC time past the cycle boundary (SYNC0 is sync0_shift_us later)
     int32_t toff_us{0};       ///< DC PI correction applied to the next period
     int32_t toff_i_us{0};     ///< integral part of toff_us
     int16_t wkc{0};           ///< working counter of the frame
+    int16_t cpu{-1};          ///< CPU the cycle ran on
   };
   static constexpr size_t TIMING_HISTORY_CYCLES = 128;
 
@@ -167,6 +169,9 @@ private:
 
   // --- Bus start-up and shutdown ---
   bool init_ethercat();
+  void setup_dc_clocks();
+  bool dc_clock_setup_ok(uint32_t attempt);
+  bool wait_for_drive_clocks();
   bool clear_latched_faults();
   bool wait_for_dc_lock();
   bool enable_drives();
@@ -190,6 +195,8 @@ private:
   void diagnostics_loop();
   void dump_fault_snapshot(const Drive & drive, bool latched_before_activation = false);
   void log_esc_error_counters(bool force);
+  int64_t dc_sync_differences(std::string & line);
+  void log_dc_sync_differences(bool force);
   void log_timing_diagnostics();
 
   SystemConfig config_;

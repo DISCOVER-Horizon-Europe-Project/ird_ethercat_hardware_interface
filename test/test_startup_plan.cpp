@@ -120,6 +120,7 @@ TEST(StartupPlan, CustomMapping)
   DriveConfig & drive = config.drives[0];
   drive.tx_pdo.push_back({0x6064, 0x00, DataType::INT32, PdoRole::NONE});
   drive.tx_pdo_index = 0x1A01;
+  drive.pdo_limits = {0, 0, 0};  // a drive without PDO limits: one object
   const auto plan = build_startup_plan(drive, config.bus);
   // 4 clears + 4 Rx + 5 Tx + 4 assigns + 2 sync
   ASSERT_EQ(plan.size(), 19u);
@@ -127,4 +128,47 @@ TEST(StartupPlan, CustomMapping)
   EXPECT_EQ(plan[11].value, 0x60640020);
   EXPECT_EQ(plan[12].value, 4);  // entry count
   EXPECT_EQ(plan[15].value, 0x1A01);
+}
+
+TEST(StartupPlan, SplitsAMappingTooLongForOnePdo)
+{
+  // The CSV mapping plus position, current and DC-link voltage (17 bytes)
+  // over the IRD's 8-byte PDOs: 0x1A00 = statusword, mode display, velocity
+  // (7 bytes); 0x1A01 = position, current (6); 0x1A02 = voltage (4).
+  SystemConfig config = naviwall_config();
+  DriveConfig & drive = config.drives[0];
+  drive.tx_pdo.push_back({0x6064, 0x00, DataType::INT32, PdoRole::POSITION_ACTUAL});
+  drive.tx_pdo.push_back({0x6078, 0x00, DataType::INT16, PdoRole::NONE, "current_actual", 0.001});
+  drive.tx_pdo.push_back({0x6079, 0x00, DataType::UINT32, PdoRole::NONE, "dc_link_voltage", 0.001});
+  expect_plan(
+      build_startup_plan(drive, config.bus),
+      {
+          {0x1C12, 0x00, DataType::UINT8, 0, true},
+          {0x1C13, 0x00, DataType::UINT8, 0, true},
+          {0x1600, 0x00, DataType::UINT8, 0, true},
+          {0x1A00, 0x00, DataType::UINT8, 0, true},
+          {0x1A01, 0x00, DataType::UINT8, 0, true},
+          {0x1A02, 0x00, DataType::UINT8, 0, true},
+          {0x1600, 0x01, DataType::UINT32, 0x60400010, true},
+          {0x1600, 0x02, DataType::UINT32, 0x60600008, true},
+          {0x1600, 0x03, DataType::UINT32, 0x60FF0020, true},
+          {0x1600, 0x00, DataType::UINT8, 3, true},
+          {0x1A00, 0x01, DataType::UINT32, 0x60410010, true},
+          {0x1A00, 0x02, DataType::UINT32, 0x60610008, true},
+          {0x1A00, 0x03, DataType::UINT32, 0x606C0020, true},
+          {0x1A00, 0x00, DataType::UINT8, 3, true},
+          {0x1A01, 0x01, DataType::UINT32, 0x60640020, true},
+          {0x1A01, 0x02, DataType::UINT32, 0x60780010, true},
+          {0x1A01, 0x00, DataType::UINT8, 2, true},
+          {0x1A02, 0x01, DataType::UINT32, 0x60790020, true},
+          {0x1A02, 0x00, DataType::UINT8, 1, true},
+          {0x1C12, 0x01, DataType::UINT16, 0x1600, true},
+          {0x1C12, 0x00, DataType::UINT8, 1, true},
+          {0x1C13, 0x01, DataType::UINT16, 0x1A00, true},
+          {0x1C13, 0x02, DataType::UINT16, 0x1A01, true},
+          {0x1C13, 0x03, DataType::UINT16, 0x1A02, true},
+          {0x1C13, 0x00, DataType::UINT8, 3, true},
+          {0x1006, 0x00, DataType::UINT32, 4000, false},
+          {0x2012, 0x01, DataType::UINT16, 4, false},
+      });
 }

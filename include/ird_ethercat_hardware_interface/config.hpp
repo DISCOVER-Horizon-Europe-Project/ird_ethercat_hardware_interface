@@ -116,6 +116,10 @@ struct BusConfig
   std::string interface{"eno1"};    ///< network interface connected to the EtherCAT bus
   uint32_t cycle_time_us{4000};      ///< process-data cycle (written to 0x1006:00)
   int rt_priority{80};               ///< SCHED_FIFO priority of the process-data thread
+  /// CPU the process-data thread is pinned to: -1 = not pinned, -2 = the
+  /// last CPU. Pin only to a CPU kept free of other RT threads and out of
+  /// deep idle states (docs/how_it_works.md); the Naviwall robot uses -2.
+  int rt_cpu{-1};
   bool distributed_clocks{true};     ///< synchronise the drives with DC SYNC0
   SyncMode sync_mode{SyncMode::HARD_SYNC};
   /// SYNC0 fires this long after the cycle boundary at which the master's
@@ -128,6 +132,18 @@ struct BusConfig
   uint32_t dc_lock_timeout_ms{3000};
   /// Frames exchanged in SAFE-OP (outputs zero) to settle the DC loop at start-up.
   uint32_t startup_settle_ms{1000};
+  /// Right after the DC clock setup (in PRE-OP), every drive's system time
+  /// must match the host clock within this, else the setup is redone, up to
+  /// dc_setup_attempts times in total. A lost frame during the setup leaves a
+  /// drive's clock off by up to seconds.
+  uint32_t dc_setup_tolerance_us{1000};
+  uint32_t dc_setup_attempts{3};
+  /// After the settle, every drive's DC system time difference to the
+  /// reference clock (ESC register 0x092C) must be below dc_sync_tolerance_ns
+  /// within dc_sync_timeout_ms; otherwise activation fails without enabling
+  /// any drive (SYNC0 would drift through the frame: error 50).
+  uint32_t dc_sync_tolerance_ns{10000};
+  uint32_t dc_sync_timeout_ms{2000};
 };
 
 struct FaultHandlingConfig
@@ -139,6 +155,18 @@ struct FaultHandlingConfig
   uint32_t recovery_cooldown_ms{500};      ///< wait after a fault before sending the reset pulse
   uint32_t reset_pulse_ms{200};            ///< max duration of the fault-reset controlword (0x0080)
   uint32_t recovery_budget_refill_ms{30000};  ///< fault-free time in operation that refills the attempts
+};
+
+/// What one PDO mapping object of the drive accepts (0 = no limit). The
+/// mapped entries are split over consecutive mapping objects (0x1A00,
+/// 0x1A01, ...) so that each stays within max_bytes and max_entries; at most
+/// max_pdos objects per direction. The defaults are the IRD's (firmware
+/// revision 0x22): 4 entries and 8 bytes per PDO, 4 PDOs per direction.
+struct PdoLimits
+{
+  uint32_t max_bytes{8};
+  uint32_t max_entries{4};
+  uint32_t max_pdos{4};
 };
 
 struct DriveConfig
@@ -166,10 +194,12 @@ struct DriveConfig
   /// rate until it matches the command (0 = no ramp). Slowing down is immediate.
   double enable_ramp_motor_rad_s2{70.0};
 
-  uint16_t rx_pdo_index{0x1600};  ///< RxPDO mapping object (master -> drive)
-  uint16_t tx_pdo_index{0x1A00};  ///< TxPDO mapping object (drive -> master)
+  uint16_t rx_pdo_index{0x1600};  ///< first RxPDO mapping object (master -> drive)
+  uint16_t tx_pdo_index{0x1A00};  ///< first TxPDO mapping object (drive -> master)
+  /// Entries in process-image order; split over mapping objects by pdo_limits.
   std::vector<PdoEntry> rx_pdo;
   std::vector<PdoEntry> tx_pdo;
+  PdoLimits pdo_limits;
 
   std::vector<SdoWrite> startup_sdos;    ///< extra PRE-OP writes, before the PDO mapping
   std::vector<SdoRead> fault_snapshot;   ///< objects read and logged when the drive faults

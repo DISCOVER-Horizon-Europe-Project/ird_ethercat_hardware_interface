@@ -12,6 +12,9 @@
 #include <cstdio>
 #include <map>
 #include <set>
+#include <tuple>
+
+#include "ird_ethercat_hardware_interface/pdo.hpp"
 
 namespace ird_ethercat_hardware_interface
 {
@@ -273,6 +276,14 @@ std::vector<std::string> validate(const SystemConfig & config)
     errors.push_back(format(
         "bus: sync0_shift_us (%u) must be smaller than cycle_time_us (%u)", bus.sync0_shift_us, bus.cycle_time_us));
   }
+  if (bus.rt_cpu < -2)
+  {
+    errors.push_back(format("bus: rt_cpu must be a CPU number, -1 (not pinned) or -2 (last CPU) (got %d)", bus.rt_cpu));
+  }
+  if (bus.dc_setup_attempts < 1)
+  {
+    errors.push_back("bus: dc_setup_attempts must be at least 1");
+  }
 
   // ---- Drives ----
   if (config.drives.empty())
@@ -358,6 +369,32 @@ std::vector<std::string> validate(const SystemConfig & config)
         {{PdoRole::MODE_DISPLAY, DataType::INT8}, {PdoRole::POSITION_ACTUAL, DataType::INT32},
          {PdoRole::VELOCITY_ACTUAL, DataType::INT32}, {PdoRole::TORQUE_ACTUAL, DataType::INT16}},
         errors);
+
+    // ---- PDO limits: the entries must fit in the drive's mapping objects ----
+    const PdoLimits & limits = drive.pdo_limits;
+    for (const auto & [which, first_index, entries] :
+         {std::make_tuple("RxPDO", drive.rx_pdo_index, &drive.rx_pdo),
+          std::make_tuple("TxPDO", drive.tx_pdo_index, &drive.tx_pdo)})
+    {
+      for (const PdoEntry & entry : *entries)
+      {
+        if (limits.max_bytes > 0 && size_of(entry.type) > limits.max_bytes)
+        {
+          errors.push_back(format(
+              "drive '%s': %s entry 0x%04X:%02X (%zu bytes) is larger than pdo_limits.max_bytes (%u)", name, which,
+              entry.index, entry.subindex, size_of(entry.type), limits.max_bytes));
+        }
+      }
+      const std::vector<PdoObject> objects = split_into_pdos(*entries, first_index, limits);
+      if (limits.max_pdos > 0 && objects.size() > limits.max_pdos)
+      {
+        errors.push_back(format(
+            "drive '%s': the %s needs %zu mapping objects (0x%04X..0x%04X) with at most %u bytes and %u entries "
+            "each, but the drive accepts at most %u (pdo_limits); map fewer objects",
+            name, which, objects.size(), objects.front().index, objects.back().index, limits.max_bytes,
+            limits.max_entries, limits.max_pdos));
+      }
+    }
 
     auto has_role = [](const std::vector<PdoEntry> & entries, PdoRole role)
     {

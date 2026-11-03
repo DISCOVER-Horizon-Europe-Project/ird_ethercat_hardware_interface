@@ -27,6 +27,24 @@ struct PdoLayout
 
 PdoLayout compute_layout(const std::vector<PdoEntry> & entries);
 
+/// One PDO mapping object and the run of entries it holds.
+struct PdoObject
+{
+  uint16_t index{0};       ///< mapping object, e.g. 0x1A01
+  size_t first_entry{0};   ///< index of its first entry in the entry list
+  size_t entry_count{0};
+  size_t size_bytes{0};
+};
+
+/// Splits the entries, in order, over consecutive mapping objects starting at
+/// `first_index`: a new object is started when the next entry would exceed
+/// limits.max_bytes or limits.max_entries. The process image is the
+/// objects' contents one after the other, i.e. the entries in list order, so
+/// compute_layout() stays valid. limits.max_pdos is not applied here (see
+/// validate()).
+std::vector<PdoObject> split_into_pdos(
+    const std::vector<PdoEntry> & entries, uint16_t first_index, const PdoLimits & limits);
+
 /// Value written to a PDO mapping object subindex: 0xIIIISSLL
 /// (object index, subindex, length in bits).
 uint32_t mapping_value(const PdoEntry & entry);

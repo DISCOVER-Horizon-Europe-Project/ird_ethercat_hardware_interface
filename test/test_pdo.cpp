@@ -100,3 +100,53 @@ TEST(Pdo, ExtendedLayoutForPowerMonitoring)
   EXPECT_EQ(layout.offsets[5], 13u);
   EXPECT_EQ(find_role(drive.tx_pdo, layout, PdoRole::POSITION_ACTUAL).offset, 7u);
 }
+
+TEST(Pdo, DefaultMappingFitsInOnePdoEach)
+{
+  const DriveConfig drive = make_ird_csv_drive();
+  const auto rx = split_into_pdos(drive.rx_pdo, drive.rx_pdo_index, drive.pdo_limits);
+  const auto tx = split_into_pdos(drive.tx_pdo, drive.tx_pdo_index, drive.pdo_limits);
+  ASSERT_EQ(rx.size(), 1u);
+  ASSERT_EQ(tx.size(), 1u);
+  EXPECT_EQ(rx[0].index, 0x1600);
+  EXPECT_EQ(tx[0].index, 0x1A00);
+  EXPECT_EQ(tx[0].entry_count, 3u);
+  EXPECT_EQ(tx[0].size_bytes, 7u);
+}
+
+TEST(Pdo, SplitKeepsTheEntryOrderAndTheLayout)
+{
+  // 7 + 4 bytes do not fit in 8: position starts 0x1A01. Splitting does not
+  // change where entries sit in the process image.
+  DriveConfig drive = make_ird_csv_drive();
+  drive.tx_pdo.push_back({0x6064, 0, DataType::INT32, PdoRole::POSITION_ACTUAL});
+  drive.tx_pdo.push_back({0x6078, 0, DataType::INT16, PdoRole::NONE, "current_actual", 0.001});
+  drive.tx_pdo.push_back({0x6079, 0, DataType::UINT32, PdoRole::NONE, "dc_link_voltage", 0.001});
+  const auto objects = split_into_pdos(drive.tx_pdo, 0x1A00, drive.pdo_limits);
+  ASSERT_EQ(objects.size(), 3u);
+  EXPECT_EQ(objects[1].index, 0x1A01);
+  EXPECT_EQ(objects[1].first_entry, 3u);
+  EXPECT_EQ(objects[1].entry_count, 2u);
+  EXPECT_EQ(objects[1].size_bytes, 6u);
+  EXPECT_EQ(objects[2].index, 0x1A02);
+  EXPECT_EQ(objects[2].first_entry, 5u);
+  EXPECT_EQ(compute_layout(drive.tx_pdo).offsets[3], 7u);
+}
+
+TEST(Pdo, SplitByEntryCount)
+{
+  const std::vector<PdoEntry> entries(5, PdoEntry{0x2000, 0, DataType::UINT8});
+  const auto objects = split_into_pdos(entries, 0x1A00, {0, 4, 0});
+  ASSERT_EQ(objects.size(), 2u);
+  EXPECT_EQ(objects[0].entry_count, 4u);
+  EXPECT_EQ(objects[1].entry_count, 1u);
+}
+
+TEST(Pdo, NoLimitsMeansOnePdo)
+{
+  const std::vector<PdoEntry> entries(9, PdoEntry{0x2000, 0, DataType::INT32});
+  const auto objects = split_into_pdos(entries, 0x1A00, {0, 0, 0});
+  ASSERT_EQ(objects.size(), 1u);
+  EXPECT_EQ(objects[0].size_bytes, 36u);
+  EXPECT_TRUE(split_into_pdos({}, 0x1A00, {}).empty());
+}

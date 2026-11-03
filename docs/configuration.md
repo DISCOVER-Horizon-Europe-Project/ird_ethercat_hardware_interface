@@ -45,6 +45,7 @@ three IRD drives in velocity mode, with every other setting at its default:
 | `slave_left_motor`, `slave_right_motor`, `slave_turret_motor` | their slave positions |
 | `transmission_ratio_wheels`, `transmission_ratio_turret` | gear ratios (wheels, turret) |
 | `encoder_ticks_per_rev` | encoder resolution |
+| `ethercat_rt_cpu` | optional: `bus.rt_cpu` (default here `-2`, the last CPU, as in the first version) |
 
 New setups should use `config_file`.
 </details>
@@ -87,6 +88,7 @@ Lists (`rx_pdo`, `tx_pdo`, `startup_sdos`, `fault_snapshot`) are replaced as a w
 | `interface` | `eno1` | Network interface connected to the drives (`ip link` lists them). |
 | `cycle_time_us` | `4000` | Process-data cycle in µs (250 to 100000). Written to every drive as 0x1006:00. |
 | `rt_priority` | `80` | SCHED_FIFO priority (1–99) of the process-data thread. |
+| `rt_cpu` | `-1` | CPU the process-data thread is pinned to: `-1` = not pinned, `-2` = the last CPU, or a CPU number. Pin it only to a CPU kept free of other real-time threads and out of deep idle states, see [How it works](how_it_works.md#4-synchronisation). |
 | `distributed_clocks` | `true` | Synchronise the drives with EtherCAT distributed clocks (DC SYNC0). Keep it on. |
 | `sync_mode` | `hard_sync` | IRD synchronisation mode (0x2012:01): `hard_sync` (4) or `soft_sync` (2). See [How it works](how_it_works.md#4-synchronisation). |
 | `sync0_shift_us` | `2000` | Time from the frame to SYNC0, when the drives latch the new references. Must be smaller than `cycle_time_us`. The IRD needs at least 100 µs. Increase it if the master's timing is noisy. |
@@ -94,6 +96,10 @@ Lists (`rx_pdo`, `tx_pdo`, `startup_sdos`, `fault_snapshot`) are replaced as a w
 | `dc_lock_ms` | `200` | ...for this long in a row... |
 | `dc_lock_timeout_ms` | `3000` | ...or this long at most, after which startup continues with a warning. |
 | `startup_settle_ms` | `1000` | Frames exchanged at startup with all outputs at zero, to let the synchronisation settle. |
+| `dc_setup_tolerance_us` | `1000` | Right after the clock setup, every drive's clock must agree with the PC's within this, otherwise the setup is redone... |
+| `dc_setup_attempts` | `3` | ...up to this many times in total. |
+| `dc_sync_tolerance_ns` | `10000` | After the settle, every drive's clock must be within this of the reference drive's (register 0x092C)... |
+| `dc_sync_timeout_ms` | `2000` | ...within this time, otherwise startup fails without enabling any drive. |
 
 ## fault_handling
 
@@ -129,6 +135,7 @@ only allowed in `drives`.
 | `expected_product_code` | `0` | Same, for the product code. |
 | `rx_pdo` | IRD velocity mapping | Objects sent to the drive every cycle. See [PDO mapping](#pdo-mapping). |
 | `tx_pdo` | IRD velocity mapping | Objects read from the drive every cycle. |
+| `pdo_limits` | IRD: 8 bytes, 4 objects, 4 PDOs | What one mapping object accepts. See [Limits of the drive](#limits-of-the-drive). |
 | `startup_sdos` | none | Objects written once at startup. See [Startup SDOs](#startup-sdos). |
 | `fault_snapshot` | IRD error objects | Objects read and logged when the drive faults. See [Fault snapshot](#fault-snapshot). |
 
@@ -139,13 +146,13 @@ the drive at every startup, so it never needs to be configured in Optio.
 
 ```yaml
 rx_pdo:                 # master -> drive
-  index: 0x1600         # mapping object (default 0x1600)
+  index: 0x1600         # first mapping object (default 0x1600)
   entries:
     - {object: "0x6040:00", type: uint16, role: controlword}
     - {object: "0x6060:00", type: int8, role: mode_of_operation}
     - {object: "0x60FF:00", type: int32, role: target_velocity}
 tx_pdo:                 # drive -> master
-  index: 0x1A00         # mapping object (default 0x1A00)
+  index: 0x1A00         # first mapping object (default 0x1A00)
   entries:
     - {object: "0x6041:00", type: uint16, role: statusword}
     - {object: "0x6061:00", type: int8, role: mode_display}
@@ -158,7 +165,7 @@ data type. Sizes and offsets are computed automatically; at startup the log show
 object sits:
 
 ```
-Drive 'left' TxPDO 0x1A00 (16 bytes): 0x6041:00 uint16 @0 statusword | 0x606C:00 int32 @2 velocity_actual | ...
+Drive 'left' TxPDO 0x1A00 (7 bytes): 0x6041:00 uint16 @0 statusword | 0x6061:00 int8 @2 mode_display | 0x606C:00 int32 @3 velocity_actual
 ```
 
 Each entry has these keys:
@@ -195,12 +202,36 @@ target for another mode would never be written. The TxPDO must contain `position
 `position_actual` the position is integrated from the velocity, and without `velocity_actual`
 the velocity is derived from the position.
 
-**Limits of the drive.** The IRD accepts up to 4 RxPDOs (0x1600–0x1603) and 4 TxPDOs
-(0x1A00–0x1A03); this interface uses one of each. The number of objects per PDO is limited by the
-drive (see the range of subindex 0 of 0x1600/0x1A00 in the CANopen manual, or the drive's ESI
-file). If a mapping is too long or contains an object that cannot be mapped, the drive rejects
-it at startup and the log shows the SDO abort code (see
-[troubleshooting](troubleshooting.md#sdo-write-failed)).
+### Limits of the drive
+
+One IRD PDO (mapping object) holds at most **4 objects and 8 bytes** (firmware revision 0x22,
+measured on the Naviwall robot: a fifth object is refused with SDO abort 0x06090011, and 10 or 11
+bytes with 0x06040042). The drive has 4 RxPDOs (0x1600–0x1603) and 4 TxPDOs (0x1A00–0x1A03).
+
+You do not have to split the mapping yourself: list the entries in one `entries` list, and the
+interface fills `index`, then the next mapping objects, in order, starting a new one whenever the
+next entry would not fit. The process data is the objects one after the other, so the order of
+the list is kept. For example, the default TxPDO (7 bytes) plus position, current and DC-link
+voltage gives:
+
+```
+Drive 'left' TxPDO 0x1A00+0x1A01+0x1A02 (17 bytes): 0x6041:00 uint16 @0 statusword | ... |
+  [0x1A01] 0x6064:00 int32 @7 position_actual | 0x6078:00 int16 @11 -> drivewhl_l_joint/current_actual |
+  [0x1A02] 0x6079:00 uint32 @13 -> drivewhl_l_joint/dc_link_voltage
+```
+
+The limits used for the split are the drive key `pdo_limits` (0 = no limit):
+
+```yaml
+pdo_limits:
+  max_bytes: 8      # per mapping object
+  max_entries: 4    # per mapping object
+  max_pdos: 4       # mapping objects per direction
+```
+
+A mapping that needs more than `max_pdos` objects is reported when the configuration is loaded.
+If the drive still rejects a mapping (for example an object that cannot be mapped), startup fails
+and the log shows the SDO abort code (see [troubleshooting](troubleshooting.md#sdo-write-failed)).
 
 ## Exposing drive registers to ROS
 

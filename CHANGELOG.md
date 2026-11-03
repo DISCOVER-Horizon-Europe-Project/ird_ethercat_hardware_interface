@@ -22,8 +22,25 @@ Not yet validated on hardware.
 - Example launch file with a one-drive robot (`launch/example.launch.py`).
 - Documentation: getting started, configuration reference, how it works, troubleshooting.
 - Unit tests (no hardware needed), including a comparison of the cyclic logic with 0.1.0.
+- **PDO mappings longer than one PDO.** The entries are split over consecutive mapping objects
+  (0x1A00, 0x1A01, ...) according to the drive's limits (`pdo_limits`; IRD: 8 bytes and 4 objects
+  per PDO, measured on the robot). Position, current and DC-link voltage can now be read next to
+  the velocity. A mapping that does not fit is reported when the configuration is loaded.
 
-The behaviour in CSV mode is unchanged from 0.1.0.
+Field fixes from the Naviwall robot's driver (2026-10-20 to 2026-10-27), not in 0.1.0:
+- **DC clock setup check:** after the clock setup, every drive's clock is compared with the PC's
+  and the setup is redone if a drive was set wrong (a lost frame refused 3 of 11 starts).
+- **Drive clock check before enabling:** every drive's clock must follow the reference drive
+  (register 0x092C) before anything is enabled; otherwise activation fails instead of faulting
+  with error 50 every few seconds.
+- **OPERATIONAL request repeated** every 200 ms to drives that missed it; on failure the AL status
+  code of every drive is read and explained.
+- **CPU pinning** of the process-data thread (`bus.rt_cpu`; the legacy URDF parameters default to
+  the last CPU, as before).
+- **Diagnostics:** the timing dump shows the send time and the CPU of each cycle, and each drive's
+  DC sync difference is logged periodically and with every fault.
+
+The default PDO mapping and the cyclic behaviour in CSV mode are unchanged from 0.1.0.
 
 ## 0.1.0
 

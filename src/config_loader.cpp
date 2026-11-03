@@ -188,11 +188,13 @@ void read_bus(Reader & r, const YAML::Node & node, BusConfig & bus)
   if (!r.expect_map(node, where)) return;
   r.check_keys(
       node, where,
-      {"interface", "cycle_time_us", "rt_priority", "distributed_clocks", "sync_mode", "sync0_shift_us",
-       "dc_lock_tolerance_us", "dc_lock_ms", "dc_lock_timeout_ms", "startup_settle_ms"});
+      {"interface", "cycle_time_us", "rt_priority", "rt_cpu", "distributed_clocks", "sync_mode", "sync0_shift_us",
+       "dc_lock_tolerance_us", "dc_lock_ms", "dc_lock_timeout_ms", "startup_settle_ms", "dc_setup_tolerance_us",
+       "dc_setup_attempts", "dc_sync_tolerance_ns", "dc_sync_timeout_ms"});
   r.string(node, "interface", where, bus.interface);
   r.integer(node, "cycle_time_us", where, bus.cycle_time_us);
   r.integer(node, "rt_priority", where, bus.rt_priority);
+  r.integer(node, "rt_cpu", where, bus.rt_cpu);
   r.boolean(node, "distributed_clocks", where, bus.distributed_clocks);
   if (const YAML::Node mode = node["sync_mode"])
   {
@@ -206,6 +208,10 @@ void read_bus(Reader & r, const YAML::Node & node, BusConfig & bus)
   r.integer(node, "dc_lock_ms", where, bus.dc_lock_ms);
   r.integer(node, "dc_lock_timeout_ms", where, bus.dc_lock_timeout_ms);
   r.integer(node, "startup_settle_ms", where, bus.startup_settle_ms);
+  r.integer(node, "dc_setup_tolerance_us", where, bus.dc_setup_tolerance_us);
+  r.integer(node, "dc_setup_attempts", where, bus.dc_setup_attempts);
+  r.integer(node, "dc_sync_tolerance_ns", where, bus.dc_sync_tolerance_ns);
+  r.integer(node, "dc_sync_timeout_ms", where, bus.dc_sync_timeout_ms);
 }
 
 void read_fault_handling(Reader & r, const YAML::Node & node, FaultHandlingConfig & faults)
@@ -263,6 +269,15 @@ void read_pdo(Reader & r, const YAML::Node & node, const std::string & where, ui
     r.real(item, "scale", at, entry.scale);
     if (ok) entries.push_back(entry);
   }
+}
+
+void read_pdo_limits(Reader & r, const YAML::Node & node, const std::string & where, PdoLimits & limits)
+{
+  if (!r.expect_map(node, where)) return;
+  r.check_keys(node, where, {"max_bytes", "max_entries", "max_pdos"});
+  r.integer(node, "max_bytes", where, limits.max_bytes);
+  r.integer(node, "max_entries", where, limits.max_entries);
+  r.integer(node, "max_pdos", where, limits.max_pdos);
 }
 
 void read_startup_sdos(Reader & r, const YAML::Node & list, const std::string & where, std::vector<SdoWrite> & out)
@@ -323,7 +338,8 @@ void read_drive(Reader & r, const YAML::Node & node, const std::string & where, 
   if (!r.expect_map(node, where)) return;
   std::vector<std::string> keys = {
       "mode", "encoder_ticks_per_rev", "gear_ratio", "rated_torque_nm", "max_motor_rpm", "enable_ramp_motor_rad_s2",
-      "expected_vendor_id", "expected_product_code", "rx_pdo", "tx_pdo", "startup_sdos", "fault_snapshot"};
+      "expected_vendor_id", "expected_product_code", "rx_pdo", "tx_pdo", "pdo_limits", "startup_sdos",
+      "fault_snapshot"};
   if (per_drive)
   {
     keys.insert(keys.begin(), {"name", "joint", "slave_position"});
@@ -353,6 +369,7 @@ void read_drive(Reader & r, const YAML::Node & node, const std::string & where, 
   r.integer(node, "expected_product_code", where, drive.expected_product_code);
   if (node["rx_pdo"]) read_pdo(r, node["rx_pdo"], where + ".rx_pdo", drive.rx_pdo_index, drive.rx_pdo);
   if (node["tx_pdo"]) read_pdo(r, node["tx_pdo"], where + ".tx_pdo", drive.tx_pdo_index, drive.tx_pdo);
+  if (node["pdo_limits"]) read_pdo_limits(r, node["pdo_limits"], where + ".pdo_limits", drive.pdo_limits);
   if (node["startup_sdos"]) read_startup_sdos(r, node["startup_sdos"], where + ".startup_sdos", drive.startup_sdos);
   if (node["fault_snapshot"])
   {

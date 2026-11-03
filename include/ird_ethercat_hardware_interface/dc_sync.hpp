@@ -20,6 +20,21 @@
 namespace ird_ethercat_hardware_interface
 {
 
+/// Decodes ESC register 0x092C (System Time Difference), which is
+/// sign-magnitude: bit 31 set means the drive's clock is behind.
+inline int64_t decode_dc_sync_difference(uint32_t reg)
+{
+  const int64_t magnitude = static_cast<int64_t>(reg & 0x7FFFFFFFu);
+  return (reg & 0x80000000u) ? -magnitude : magnitude;
+}
+
+/// Host clock (Unix epoch) to EtherCAT DC time, which counts from 2000-01-01 [ns].
+inline int64_t to_ethercat_time_ns(int64_t unix_seconds, int64_t nanoseconds)
+{
+  constexpr int64_t ETHERCAT_EPOCH_UNIX_S = 946684800;
+  return (unix_seconds - ETHERCAT_EPOCH_UNIX_S) * 1'000'000'000LL + nanoseconds;
+}
+
 class DcSync
 {
 public:

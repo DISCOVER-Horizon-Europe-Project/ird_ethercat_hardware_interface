@@ -54,12 +54,12 @@ drives.
 |---|---|---|---|
 | 1 | INIT → PRE-OP | Open the network interface, scan the bus, list every device, check positions (and identities if configured). | `Found N slave(s).`, `Slave 1: ...` |
 | 2 | PRE-OP | Configure every drive by SDO: mode of operation, `startup_sdos`, PDO mapping, cycle period (0x1006) and sync mode (0x2012). | `Configuring drive 'x'...` |
-| 3 | PRE-OP | Map the process image; start the distributed clocks and SYNC0 on every drive. | `Configured DC SYNC0: ...` |
+| 3 | PRE-OP | Map the process image. Set up the distributed clocks and check that every drive's clock was set right, redoing the setup if not (up to `dc_setup_attempts`). Start SYNC0 on every drive. | `DC clock setup (attempt 1), ...`, `Configured DC SYNC0: ...` |
 | 4 | → SAFE-OP | Check that the mapped sizes match the configuration, then request SAFE-OP. The drives latch their synchronisation mode here. | `Process data mapping validated`, `All slaves reached SAFE-OP.` |
-| 5 | SAFE-OP | Exchange frames for `startup_settle_ms` with all outputs at zero, so the master's timing locks to the drives' clock. Report the sync mode each drive latched. | `HardSync established` |
+| 5 | SAFE-OP | Exchange frames for `startup_settle_ms` with all outputs at zero, so the master's timing locks to the drives' clock. Keep exchanging until every drive's clock is within `dc_sync_tolerance_ns` of the reference drive (at most `dc_sync_timeout_ms`, else startup fails). Report the sync mode each drive latched. | `Drive clocks synchronised ...`, `HardSync established` |
 | 6 | SAFE-OP | Clear any fault left by a previous session (one SDO fault reset per faulted drive). | `fault latched before activation` (warning) |
-| 7 | SAFE-OP | Start the process-data and diagnostics threads. Wait until the frames stay within `dc_lock_tolerance_us` of their target for `dc_lock_ms`. | `DC phase locked` |
-| 8 | → OPERATIONAL | Request OPERATIONAL. From now on the drives check every frame. | `All slaves reached OPERATIONAL state.` |
+| 7 | SAFE-OP | Start the process-data thread (pinned to `rt_cpu` if set) and the diagnostics thread. Wait until the frames stay within `dc_lock_tolerance_us` of their target for `dc_lock_ms`. | `Processdata thread pinned to CPU N.`, `DC phase locked` |
+| 8 | → OPERATIONAL | Request OPERATIONAL, and repeat the request every 200 ms to any drive not there yet. From now on the drives check every frame. | `All slaves reached OPERATIONAL state.` |
 | 9 | OPERATIONAL | Run the CiA 402 enable sequence through the cyclic controlword. | `All drives enabled successfully.` |
 
 Any failure stops the startup with an error explaining which step and which drive failed, and
@@ -72,6 +72,20 @@ therefore stops SOEM from requesting SAFE-OP by itself after mapping, and reques
 in step 4. Steps 5–7 make sure the frames already arrive at a stable time before the drives
 start monitoring them in OPERATIONAL. Enabling while the timing is still settling was a source of
 error 50 right after startup.
+
+**Checking the drives' clocks (steps 3 and 5).** The DC clock setup sets every drive's clock
+from one reading of a local time, and SOEM ignores a failed read or write during it. One lost
+frame then leaves a drive's clock off by however far the drives' free-running clocks are apart:
+on the Naviwall robot 0.5–1.7 s, which refused 3 of 11 starts. Such a drive never synchronises,
+SYNC0 drifts through the frame window, and the drive reports error 50 every few seconds. So the
+interface compares every drive's time with the PC's right after the setup (and redoes it), and
+waits until every drive follows the reference drive closely before enabling anything (good
+starts read a few hundred ns).
+
+**Repeating the OPERATIONAL request (step 8).** The request is one broadcast. A drive that
+missed it stays in SAFE-OP without any error until the activation times out; this happened twice
+on the Naviwall robot. If activation still fails, the AL status code of every drive is read and
+logged with its meaning.
 
 ## 3. Every cycle
 
@@ -131,6 +145,20 @@ that delay.
 
 On the robot where this interface was developed (EtherCAT sharing its port with lidar traffic),
 SoftSync faulted 15–25 times more often than HardSync with a 2 ms shift.
+
+**The CPU of the process-data thread** (`bus.rt_cpu`). The thread runs at SCHED_FIFO
+`rt_priority`, but a thread of higher priority on the same CPU still delays it. On the Naviwall
+robot a robot-arm driver at priority 99 held it about 2.5 ms between waking and sending, so the
+frame reached the drives after SYNC0 (error 50). Pinning the thread to a CPU helps only if that
+CPU is kept for it:
+
+- keep other processes off it, e.g. systemd `CPUAffinity=` in `/etc/systemd/system.conf`
+  (every process started after boot inherits it) or the kernel option `isolcpus=`;
+- keep it out of deep idle states: an idle CPU in a deep C-state takes long to wake. On a Jetson
+  Orin the deepest state (5 ms exit latency) made the pinned thread wake 2–7 ms late, until it
+  was disabled for that CPU (`/sys/devices/system/cpu/cpuN/cpuidle/stateK/disable`).
+
+Without that preparation, leave `rt_cpu: -1` (not pinned).
 
 ## 5. Enabling the drives (CiA 402)
 
@@ -226,19 +254,32 @@ explain it are printed (plus the last 8 for context), oldest first:
 
 ```
 EtherCAT timing before the fault (last 128 cycles, oldest first; expected WKC 9, SYNC0 at DC phase 2000 us):
-  cycle  -37: wake late   612 us, exchange   143 us, DC phase  1952 us, toff    1 us (I    0), WKC 9  <--
+  cycle  -37: wake late   612 us, send    20 us, exchange   143 us, DC phase  1952 us, toff    1 us (I    0), WKC 9, CPU 11  <--
 ```
 
 | Field | Meaning | Points to |
 |---|---|---|
-| wake late | how late the thread woke after its deadline | the PC (scheduling, CPU load, no RT kernel) |
+| wake late | how late the thread woke after its deadline | the PC (scheduling, CPU load, deep idle state, no RT kernel) |
+| send | from the start of the exchange until the frame was handed to the kernel | large with an on-time wake: the thread was held before sending (CPU contention) |
 | exchange | time to send and receive the frame | the network (port shared, interrupt moderation) |
 | DC phase | when the frame passed the drives, from the cycle boundary; SYNC0 is at `sync0_shift_us` | close to or past SYNC0: the frame was late for the drives |
 | toff (I) | correction of the cycle by the synchronisation loop (integral part) | large values: the PC clock drifts from the drives |
 | WKC | working counter: how many drives processed the frame | below the expected value: a frame was lost or not processed |
+| CPU | the CPU the cycle ran on | a different CPU than `rt_cpu`: the pinning did not apply |
 
-Marked lines (`<--`) are the anomalous ones: WKC too low, woke > 200 µs late, DC phase within
-100 µs of SYNC0 (or past it), or exchange > 1 ms.
+Marked lines (`<--`) are the anomalous ones: WKC too low, woke or send > 200 µs late, DC phase
+within 100 µs of SYNC0 (or past it), or exchange > 1 ms.
+
+**DC sync difference.** Every 10 s, each drive's clock difference to the reference drive
+(register 0x092C) is read. It is logged once as a baseline, with every fault, and whenever a
+drive is more than 1 µs off:
+
+```
+DC sync difference to the reference clock: left +0 ns; right +19 ns; turret +1699 ns;
+```
+
+A fault on one drive with clean master timing and a large difference on that drive points to
+its clock rather than to the PC or the network.
 
 **ESC error counters.** Every 10 s, and with every fault, the interface reads each drive's
 EtherCAT controller error counters (registers 0x0300–0x0313) and logs them when they changed:

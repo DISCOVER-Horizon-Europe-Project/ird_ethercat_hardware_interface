@@ -58,8 +58,12 @@ public:
   bool configure_drive(const DriveConfig & drive, const BusConfig & bus);
   /// Maps the process image of all slaves.
   bool map_process_data();
+  /// Sets up the distributed clocks of all slaves (offsets, propagation
+  /// delays, drift compensation). SOEM ignores failed reads and writes here,
+  /// so check the result (dc_time_minus_host) and repeat if needed.
+  void setup_dc_clocks();
   /// Starts SYNC0 on the given slaves.
-  void configure_dc(const std::vector<int> & slaves, int64_t cycle_ns, int64_t shift_ns);
+  void start_sync0(const std::vector<int> & slaves, int64_t cycle_ns, int64_t shift_ns);
 
   // ---- Process data ----
   uint8_t * outputs(int slave) { return ctx_.slavelist[slave].outputs; }
@@ -67,8 +71,9 @@ public:
   size_t output_bytes(int slave) const { return ctx_.slavelist[slave].Obytes; }
   size_t input_bytes(int slave) const { return ctx_.slavelist[slave].Ibytes; }
   /// Sends the outputs and receives the inputs of all slaves in one frame.
-  /// Returns the working counter.
-  int exchange();
+  /// Returns the working counter. If `sent_at` is given, it receives the
+  /// time the frame was handed to the kernel.
+  int exchange(ec_timet * sent_at = nullptr);
   int expected_wkc() const { return expected_wkc_; }
 
   // ---- Distributed clocks ----
@@ -82,7 +87,13 @@ public:
   void request_state(uint16_t state);
   /// Waits until every slave in `slaves` reports `state`. Safe to call while
   /// the process-data thread runs: the bus lock is only held for each poll.
-  bool wait_for_state(const std::vector<int> & slaves, uint16_t state, int64_t timeout_us);
+  /// With repeat_request_us > 0, `state` is requested again from every slave
+  /// not there yet at that interval (a drive can miss the broadcast request).
+  bool wait_for_state(
+      const std::vector<int> & slaves, uint16_t state, int64_t timeout_us, int64_t repeat_request_us = 0);
+  /// Reads the AL state and AL status code of all slaves (state() and
+  /// al_status_code() otherwise only reflect the last state check).
+  void read_states();
   uint16_t state(int slave) const { return ctx_.slavelist[slave].state; }
   uint16_t al_status_code(int slave) const { return ctx_.slavelist[slave].ALstatuscode; }
 
@@ -95,6 +106,16 @@ public:
   bool read_esc_error_counters(int slave, std::array<uint8_t, 20> & counters);
   /// Logs SOEM's and the ESC's view of a slave's DC configuration (debug level).
   void log_dc_snapshot(int slave);
+  /// The slave's DC system time (register 0x0910) minus the host clock read
+  /// just before, in the EtherCAT epoch the clock setup used [ns]. Equal for
+  /// all slaves, within a frame round trip, when the setup worked.
+  bool dc_time_minus_host(int slave, int64_t & delta_ns);
+  /// System time offset written by the clock setup (register 0x0920) [ns].
+  bool dc_system_time_offset(int slave, int64_t & offset_ns);
+  /// System time difference to the reference clock (register 0x092C) [ns].
+  bool dc_sync_difference(int slave, int64_t & difference_ns);
+  int propagation_delay_ns(int slave) const { return ctx_.slavelist[slave].pdelay; }
+  int entry_port(int slave) const { return ctx_.slavelist[slave].entryport; }
 
 private:
   void log_mailbox_failure(int slave, const char * what);

@@ -70,3 +70,20 @@ TEST(DcSync, ConvergesToTheTargetPhase)
   }
   EXPECT_LT(std::abs(dc.phase_ns(dc_time)), 1'000);
 }
+
+TEST(DcSync, SyncDifferenceRegisterIsSignMagnitude)
+{
+  using ird_ethercat_hardware_interface::decode_dc_sync_difference;
+  EXPECT_EQ(decode_dc_sync_difference(0x00000013u), 19);
+  EXPECT_EQ(decode_dc_sync_difference(0x80000013u), -19);
+  EXPECT_EQ(decode_dc_sync_difference(0x7FFFFFFFu), 0x7FFFFFFF);
+  EXPECT_EQ(decode_dc_sync_difference(0x80000000u), 0);
+}
+
+TEST(DcSync, EthercatTimeCountsFrom2000)
+{
+  using ird_ethercat_hardware_interface::to_ethercat_time_ns;
+  EXPECT_EQ(to_ethercat_time_ns(946684800, 5), 5);
+  EXPECT_EQ(to_ethercat_time_ns(946684801, 0), 1'000'000'000);
+  EXPECT_LT(to_ethercat_time_ns(0, 0), 0);  // a host clock still at 1970
+}

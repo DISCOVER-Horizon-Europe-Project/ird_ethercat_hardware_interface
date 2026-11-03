@@ -40,6 +40,12 @@ bus:
   # Real-time priority (SCHED_FIFO, 1..99) of the thread that runs the cycle.
   rt_priority: 80
 
+  # CPU the cycle thread is pinned to: -1 = not pinned, -2 = the last CPU, or a
+  # CPU number. Pinning helps only if that CPU is kept free of other real-time
+  # threads and out of deep idle states (see docs/how_it_works.md). The
+  # Naviwall robot uses -2, with CPU 11 reserved for it.
+  rt_cpu: -1
+
   # Synchronise the drives with EtherCAT distributed clocks (SYNC0). Strongly
   # recommended: without it the drives are not synchronised to the master.
   distributed_clocks: true
@@ -69,6 +75,20 @@ bus:
   # Frames exchanged at startup, with all outputs at zero, to let the
   # distributed-clock synchronisation settle.
   startup_settle_ms: 1000
+
+  # Checks of the drives' clocks at startup (with distributed clocks):
+  # - Right after the clock setup, every drive's clock must agree with the
+  #   master's within dc_setup_tolerance_us, otherwise the setup is redone (up
+  #   to dc_setup_attempts times). A frame lost during the setup leaves a drive
+  #   seconds off.
+  # - After the settle, every drive's clock must be within dc_sync_tolerance_ns
+  #   of the reference drive (register 0x092C) within dc_sync_timeout_ms,
+  #   otherwise startup fails without enabling any drive. Good starts read a
+  #   few hundred ns at most.
+  dc_setup_tolerance_us: 1000
+  dc_setup_attempts: 3
+  dc_sync_tolerance_ns: 10000
+  dc_sync_timeout_ms: 2000
 
 
 # -----------------------------------------------------------------------------
@@ -175,20 +195,25 @@ drive_defaults:
   #              They do not need to be declared in the URDF.
   #
   # Example: also read the position, the motor current and the DC-link voltage
-  # (CiA 402 objects; check their units in the drive manual for `scale`):
+  # (CiA 402 objects: 0x6078 in 1/1000 of the motor rated current, 0x6079 in
+  # mV; check them in the drive manual for `scale`):
   #   tx_pdo:
   #     index: 0x1A00
   #     entries:
   #       - {object: "0x6041:00", type: uint16, role: statusword}
+  #       - {object: "0x6061:00", type: int8,   role: mode_display}
   #       - {object: "0x606C:00", type: int32,  role: velocity_actual}
   #       - {object: "0x6064:00", type: int32,  role: position_actual}
   #       - {object: "0x6078:00", type: int16,  interface: current_actual, scale: 0.001}
   #       - {object: "0x6079:00", type: uint32, interface: dc_link_voltage, scale: 0.001}
   #
-  # The IRD accepts up to 4 RxPDOs (0x1600-0x1603) and 4 TxPDOs (0x1A00-0x1A03);
-  # this interface uses one of each. If the drive rejects a mapping (too many
-  # objects, or an object that cannot be mapped), startup fails and the log
-  # shows the SDO abort code (0x06040042: too long, 0x06040041: not mappable).
+  # `index` is the first mapping object. One IRD PDO holds at most 4 objects
+  # and 8 bytes, so a longer list is split over the next mapping objects
+  # (0x1A01, 0x1A02, ...) automatically: the example above uses 0x1A00 (7
+  # bytes), 0x1A01 (position and current) and 0x1A02 (voltage). The startup
+  # log shows the split. If the drive still rejects a mapping (e.g. an object
+  # that cannot be mapped), startup fails and the log shows the SDO abort code
+  # (0x06040041: not mappable, 0x06040042: too long, 0x06090011: too many).
   rx_pdo:
     index: 0x1600
     entries:
@@ -201,6 +226,14 @@ drive_defaults:
       - {object: "0x6041:00", type: uint16, role: statusword}
       - {object: "0x6061:00", type: int8, role: mode_display}
       - {object: "0x606C:00", type: int32, role: velocity_actual}
+
+  # What one PDO mapping object of the drive accepts (0 = no limit), used to
+  # split the entries above. The IRD (firmware revision 0x22) takes 8 bytes and
+  # 4 objects per PDO, and 4 PDOs per direction (0x1600-0x1603, 0x1A00-0x1A03).
+  pdo_limits:
+    max_bytes: 8
+    max_entries: 4
+    max_pdos: 4
 
   # Extra objects written by SDO at startup (in PRE-OP), before the PDO
   # mapping, in the order listed. If a write fails, startup fails, unless the

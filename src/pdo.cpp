@@ -23,6 +23,29 @@ PdoLayout compute_layout(const std::vector<PdoEntry> & entries)
   return layout;
 }
 
+std::vector<PdoObject> split_into_pdos(
+    const std::vector<PdoEntry> & entries, uint16_t first_index, const PdoLimits & limits)
+{
+  std::vector<PdoObject> objects;
+  for (size_t i = 0; i < entries.size(); ++i)
+  {
+    const size_t bytes = size_of(entries[i].type);
+    const bool full = !objects.empty() &&
+        ((limits.max_entries > 0 && objects.back().entry_count + 1 > limits.max_entries) ||
+         (limits.max_bytes > 0 && objects.back().size_bytes + bytes > limits.max_bytes));
+    if (objects.empty() || full)
+    {
+      PdoObject object;
+      object.index = static_cast<uint16_t>(first_index + objects.size());
+      object.first_entry = i;
+      objects.push_back(object);
+    }
+    objects.back().entry_count += 1;
+    objects.back().size_bytes += bytes;
+  }
+  return objects;
+}
+
 uint32_t mapping_value(const PdoEntry & entry)
 {
   return (static_cast<uint32_t>(entry.index) << 16) | (static_cast<uint32_t>(entry.subindex) << 8) |
