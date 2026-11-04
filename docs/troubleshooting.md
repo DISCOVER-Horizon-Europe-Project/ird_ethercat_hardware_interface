@@ -178,6 +178,8 @@ soft_sync` tolerates more jitter (with looser synchronisation).
 | `read(): WKC below expectation: got A expected at least B` | Frames come back with fewer drives having processed them: a drive left OPERATIONAL or a link is intermittent. Check the cabling and the drives' state. |
 | `Drive 'x' (slave N) ESC error counters: ...` | Logged when a drive's EtherCAT error counters change (see above). A single change after power-on is normal; steadily increasing values are not. |
 | `DC sync difference to the reference clock: ...` | Each drive's clock difference to the reference drive. Logged once as a baseline (info), with every fault, and as a warning whenever a drive is more than 1 µs off. A drive that stays off by microseconds or more loses synchronisation: expect error 50 on it. |
+| `Lost contact with the drives: no complete frame for N ms (working counter A, expected B). ...` | No frame came back with every drive's data (A = 0 or -1: none at all). Expected after an e-stop that cuts the drives' power; otherwise check the drives' power and the EtherCAT cables. The drives stay stopped: restart the interface (or the ros2_control node) once they are powered. |
+| `Hardware interface stopped after losing contact with the drives. ...` | Follows the message above when `bus_loss_read_error` is true: ros2_control has stopped the controllers commanding these joints. |
 | `Not all drives confirmed SAFE-OP before stopping the process data.` | Warning at shutdown: a drive did not confirm SAFE-OP in time. It may report error 49/50 at the next start, which is then cleared automatically. |
 
 ## 9. Reference tables

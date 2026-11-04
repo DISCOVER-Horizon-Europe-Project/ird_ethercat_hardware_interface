@@ -251,12 +251,15 @@ struct Bench
   {
     const CycleFlags f = CyclicController::begin_cycle(flags);
     controller.stage(f, targets, statuswords, actual_positions, controlwords, references);
-    for (size_t i = 0; i < drives.size(); ++i)
+    if (frame_ok)  // otherwise the drives get nothing and the statuswords stay stale
     {
-      drives[i].receive(controlwords[i]);
-      statuswords[i] = drives[i].statusword();
+      for (size_t i = 0; i < drives.size(); ++i)
+      {
+        drives[i].receive(controlwords[i]);
+        statuswords[i] = drives[i].statusword();
+      }
     }
-    return controller.evaluate(f, statuswords, flags);
+    return controller.evaluate(f, statuswords, frame_ok, flags);
   }
 
   /// Runs until `done` or `limit` cycles; returns the number of cycles run.
@@ -285,6 +288,7 @@ struct Bench
   std::vector<int32_t> actual_positions;
   std::vector<uint16_t> controlwords;
   std::vector<int32_t> references;
+  bool frame_ok{true};
   CycleEvents last;
 };
 
@@ -452,6 +456,116 @@ TEST(CyclicController, DriveInFaultAbortsTheInitialEnable)
   EXPECT_EQ(cycles, 25);
   EXPECT_TRUE(bench.flags.enable_fault_abort.load());
   EXPECT_FALSE(bench.flags.enable_request.load());
+}
+
+TEST(CyclicController, BusLossStopsTheDrivesAfterTheTimeout)
+{
+  Bench bench;
+  bench.enable_and_wait();
+  std::fill(bench.targets.begin(), bench.targets.end(), 2000);
+  bench.run_until([](const CycleEvents &) { return false; }, 50);
+
+  // E-stop: no frame comes back. The stale statuswords still read
+  // Operation Enabled, so no fault is seen; 100 ms = 25 cycles.
+  bench.frame_ok = false;
+  const int cycles = bench.run_until([](const CycleEvents & e) { return e.bus_lost; }, 1000);
+  EXPECT_EQ(cycles, 25);
+  EXPECT_EQ(bench.controller.bus_loss_cycles(), 25u);
+  EXPECT_TRUE(bench.flags.bus_lost.load());
+  EXPECT_FALSE(bench.flags.enable_request.load());
+  EXPECT_FALSE(bench.flags.operation_enabled.load());
+  EXPECT_TRUE(bench.flags.force_zero.load());
+  EXPECT_FALSE(bench.last.fault_detected);
+
+  bench.cycle();
+  for (uint16_t cw : bench.controlwords) EXPECT_EQ(cw, cia402::CW_DISABLE_VOLTAGE);
+  for (int32_t ref : bench.references) EXPECT_EQ(ref, 0);
+}
+
+TEST(CyclicController, NoRecoveryAfterABusLoss)
+{
+  Bench bench;
+  bench.enable_and_wait();
+  bench.frame_ok = false;
+  ASSERT_GT(bench.run_until([](const CycleEvents & e) { return e.bus_lost; }, 1000), 0);
+
+  // The drives answer again, in FAULT (as after a fieldbus error): they stay
+  // disabled, nothing is reset and no further event is reported.
+  bench.frame_ok = true;
+  for (auto & drive : bench.drives) drive.inject_fault();
+  for (int i = 0; i < 10'000; ++i)
+  {
+    const CycleEvents e = bench.cycle();
+    ASSERT_FALSE(e.bus_lost || e.fault_detected || e.recovered || e.recovery_scheduled) << "cycle " << i;
+    for (uint16_t cw : bench.controlwords) ASSERT_EQ(cw, cia402::CW_DISABLE_VOLTAGE) << "cycle " << i;
+  }
+  EXPECT_TRUE(bench.flags.bus_lost.load());
+
+  // Until the next activation.
+  bench.controller.reset();
+  bench.flags.bus_lost = false;
+  for (auto & drive : bench.drives) drive = FakeDrive();
+  bench.enable_and_wait();
+}
+
+TEST(CyclicController, ShortFrameLossesAreTolerated)
+{
+  Bench bench;
+  bench.enable_and_wait();
+  std::fill(bench.targets.begin(), bench.targets.end(), 2000);
+  for (int burst = 0; burst < 20; ++burst)
+  {
+    bench.frame_ok = false;
+    for (int i = 0; i < 24; ++i) ASSERT_FALSE(bench.cycle().bus_lost);
+    bench.frame_ok = true;
+    ASSERT_FALSE(bench.cycle().bus_lost);
+  }
+  EXPECT_TRUE(bench.flags.operation_enabled.load());
+  EXPECT_FALSE(bench.flags.bus_lost.load());
+  EXPECT_EQ(bench.references[0], 2000);
+}
+
+TEST(CyclicController, IncompleteFramesOutsideOperationAreIgnored)
+{
+  // Before the enable (SAFE-OP) and after a stop, the working counter is
+  // legitimately short.
+  Bench bench;
+  bench.frame_ok = false;
+  for (int i = 0; i < 1000; ++i) ASSERT_FALSE(bench.cycle().bus_lost);
+
+  bench.frame_ok = true;
+  bench.enable_and_wait();
+  bench.flags.enable_request = false;
+  bench.flags.operation_enabled = false;
+  bench.frame_ok = false;
+  for (int i = 0; i < 1000; ++i) ASSERT_FALSE(bench.cycle().bus_lost);
+  EXPECT_FALSE(bench.flags.bus_lost.load());
+}
+
+TEST(CyclicController, BusLossDuringTheEnableIsDetected)
+{
+  Bench bench;
+  bench.flags.enable_request = true;
+  bench.cycle();
+  bench.frame_ok = false;
+  EXPECT_EQ(bench.run_until([](const CycleEvents & e) { return e.bus_lost; }, 1000), 25);
+  EXPECT_FALSE(bench.flags.operation_enabled.load());
+}
+
+TEST(CyclicController, BusLossTimeoutZeroNeverDetects)
+{
+  FaultHandlingConfig faults = naviwall_config().faults;
+  faults.bus_loss_timeout_ms = 0;
+  CyclicController controller(faults, 4000, std::vector<DriveMotion>(3));
+  SharedFlags flags;
+  flags.enable_request = true;
+  flags.operation_enabled = true;
+  const std::vector<uint16_t> statuswords(3, 0x0637);
+  for (int i = 0; i < 10'000; ++i)
+  {
+    ASSERT_FALSE(controller.evaluate(CyclicController::begin_cycle(flags), statuswords, false, flags).bus_lost);
+  }
+  EXPECT_EQ(controller.bus_loss_cycles(), 0u);
 }
 
 TEST(CyclicController, IdenticalToV010UnderRandomFaults)

@@ -155,6 +155,8 @@ struct FaultHandlingConfig
   uint32_t recovery_cooldown_ms{500};      ///< wait after a fault before sending the reset pulse
   uint32_t reset_pulse_ms{200};            ///< max duration of the fault-reset controlword (0x0080)
   uint32_t recovery_budget_refill_ms{30000};  ///< fault-free time in operation that refills the attempts
+  uint32_t bus_loss_timeout_ms{100};       ///< frames without every drive's data this long = contact lost (0 = never)
+  bool bus_loss_read_error{true};          ///< after a bus loss, read() returns ERROR to ros2_control
 };
 
 /// What one PDO mapping object of the drive accepts (0 = no limit). The

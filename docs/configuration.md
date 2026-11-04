@@ -112,8 +112,10 @@ Lists (`rx_pdo`, `tx_pdo`, `startup_sdos`, `fault_snapshot`) are replaced as a w
 | `recovery_cooldown_ms` | `500` | Wait after a fault before trying to reset it. |
 | `reset_pulse_ms` | `200` | Longest time the fault-reset command is sent. If the fault has not cleared by then, the attempt failed. |
 | `recovery_budget_refill_ms` | `30000` | After this long without faults, the count of attempts starts again from zero. |
+| `bus_loss_timeout_ms` | `100` | No frame with every drive's data for this long (e-stop cutting the drives' power, cable unplugged) = contact lost: error logged, drives stopped, no automatic recovery. `0`: never detect. |
+| `bus_loss_read_error` | `true` | After a bus loss, `read()` returns ERROR: ros2_control stops the controllers commanding these joints and the interface goes to *unconfigured* (on Humble a `joint_state_broadcaster` keeps running, with the last positions and zero velocities). `false`: `read()` keeps returning OK, positions hold their last value and velocities read 0. |
 
-What happens during a fault is described in [How it works](how_it_works.md#7-runtime-faults-and-automatic-recovery).
+What happens during a fault and after a bus loss is described in [How it works](how_it_works.md#7-runtime-faults-and-automatic-recovery).
 
 ## Drive keys
 

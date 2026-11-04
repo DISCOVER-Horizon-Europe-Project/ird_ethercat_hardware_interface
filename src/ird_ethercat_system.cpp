@@ -129,7 +129,11 @@ IrdEthercatSystem::~IrdEthercatSystem()
 {
   // Normally done by on_deactivate/on_shutdown; this only covers the plugin
   // being destroyed while still active, so that no thread outlives it.
-  if (ec_initialized_)
+  if (ec_initialized_ && flags_.bus_lost.load())
+  {
+    close_lost_bus();
+  }
+  else if (ec_initialized_)
   {
     disable_drives_and_leave_op();
     shutdown_ethercat();
@@ -574,6 +578,11 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_cleanup(const rclcpp_li
 hardware_interface::CallbackReturn IrdEthercatSystem::on_activate(const rclcpp_lifecycle::State & /*previous_state*/)
 {
   RCLCPP_INFO(logger_, "Activating IRD EtherCAT hardware interface...");
+  if (ec_initialized_)
+  {
+    close_lost_bus();  // still open after a bus loss (see on_error)
+  }
+  flags_.bus_lost.store(false);
 
   // Lock all process memory: a single page fault in the RT thread can stall
   // the cycle long enough to trip the drives' fieldbus SYNC monitor.
@@ -660,7 +669,11 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_activate(const rclcpp_l
 hardware_interface::CallbackReturn IrdEthercatSystem::on_deactivate(const rclcpp_lifecycle::State & /*previous_state*/)
 {
   RCLCPP_INFO(logger_, "Deactivating hardware interface...");
-  if (ec_initialized_)
+  if (ec_initialized_ && flags_.bus_lost.load())
+  {
+    close_lost_bus();
+  }
+  else if (ec_initialized_)
   {
     disable_drives_and_leave_op();
     shutdown_ethercat();
@@ -672,13 +685,29 @@ hardware_interface::CallbackReturn IrdEthercatSystem::on_deactivate(const rclcpp
 hardware_interface::CallbackReturn IrdEthercatSystem::on_shutdown(const rclcpp_lifecycle::State & /*previous_state*/)
 {
   RCLCPP_INFO(logger_, "Shutting down hardware interface...");
-  if (ec_initialized_)
+  if (ec_initialized_ && flags_.bus_lost.load())
+  {
+    close_lost_bus();
+  }
+  else if (ec_initialized_)
   {
     RCLCPP_WARN(logger_, "EtherCAT still active during shutdown. Forcing cleanup...");
     disable_drives_and_leave_op();
     shutdown_ethercat();
   }
   RCLCPP_INFO(logger_, "Hardware interface shutdown complete.");
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+hardware_interface::CallbackReturn IrdEthercatSystem::on_error(const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  // Called by ros2_control from its update loop, right after read() returned
+  // ERROR, so it must not block: other hardware (e.g. a robot arm) shares
+  // that loop. The RT thread keeps sending disabled controlwords; the bus is
+  // closed on shutdown or before the next activation.
+  RCLCPP_ERROR(
+      logger_, "Hardware interface stopped after losing contact with the drives. Restart it (or the whole "
+      "ros2_control node) once the drives are powered again.");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -698,6 +727,20 @@ hardware_interface::return_type IrdEthercatSystem::read(const rclcpp::Time & /*t
       RCLCPP_WARN(
           logger_, "read(): WKC below expectation: got %d expected at least %d", recv_wkc, master_->expected_wkc());
     }
+  }
+
+  if (flags_.bus_lost.load())
+  {
+    // The inputs are those of the last frame before the loss: keep the
+    // positions, but nothing is known to move (and integrating the last
+    // velocity would make the position drift).
+    for (const auto & drive : drives_)
+    {
+      drive->vel = 0.0;
+      drive->effort = 0.0;
+    }
+    return config_.faults.bus_loss_read_error ? hardware_interface::return_type::ERROR
+                                              : hardware_interface::return_type::OK;
   }
 
   // Drive feedback is at the motor shaft; joints are on the gearbox output.
@@ -1287,6 +1330,11 @@ bool IrdEthercatSystem::enable_drives()
       RCLCPP_INFO(logger_, "All slaves reached Operation Enabled through PDO.");
       return true;
     }
+    if (flags_.bus_lost.load())
+    {
+      RCLCPP_ERROR(logger_, "Lost contact with the drives while enabling them.");
+      return false;
+    }
     if (flags_.enable_fault_abort.load())
     {
       RCLCPP_ERROR(
@@ -1350,6 +1398,17 @@ void IrdEthercatSystem::shutdown_ethercat()
   master_->close();
   ec_initialized_ = false;
   RCLCPP_INFO(logger_, "EtherCAT connection closed.");
+}
+
+// After a bus loss the drives do not answer: stopping them through the PDO
+// and waiting for their state changes would only time out.
+void IrdEthercatSystem::close_lost_bus()
+{
+  RCLCPP_INFO(logger_, "Closing the EtherCAT connection (no contact with the drives).");
+  stop_processdata_thread();
+  stop_diagnostics_thread();
+  master_->close();
+  ec_initialized_ = false;
 }
 
 // =========================================================================
@@ -1618,8 +1677,9 @@ void IrdEthercatSystem::processdata_loop()
     }
 
     // ---- 5. Fault detection and recovery ----
-    const CycleEvents events = controller_->evaluate(flags, rt_statuswords_, flags_);
-    if (events.fault_detected)
+    const bool frame_complete = recv_wkc >= master_->expected_wkc();
+    const CycleEvents events = controller_->evaluate(flags, rt_statuswords_, frame_complete, flags_);
+    if (events.fault_detected || events.bus_lost)
     {
       // Diagnostics (SDO reads) are deferred to the diagnostics thread;
       // running them here would stall the cyclic RPDO for tens of ms and
@@ -1632,7 +1692,7 @@ void IrdEthercatSystem::processdata_loop()
         }
         timing_dump_ready_.store(true, std::memory_order_release);
       }
-      fault_dump_pending_.store(events.fault_mask, std::memory_order_release);
+      fault_dump_pending_.store(events.fault_mask, std::memory_order_release);  // 0 on a bus loss: no SDO reads
     }
     log_cycle_events(events);
   }
@@ -1666,6 +1726,14 @@ void IrdEthercatSystem::log_cycle_events(const CycleEvents & events)
           logger_, "Runtime drive fault (SW %s): recovery attempts exhausted (%u). Drives stay disabled.", statuswords,
           max_attempts);
     }
+  }
+  if (events.bus_lost)
+  {
+    RCLCPP_ERROR(
+        logger_, "Lost contact with the drives: no complete frame for %u ms (working counter %d, expected %d). "
+        "E-stop pressed, drive power off or EtherCAT cable? The drives are stopped and stay stopped until the "
+        "hardware interface is restarted.",
+        config_.faults.bus_loss_timeout_ms, last_processdata_wkc_.load(), master_->expected_wkc());
   }
   if (events.reset_retry)
   {
@@ -1726,6 +1794,7 @@ void IrdEthercatSystem::diagnostics_loop()
     std::this_thread::sleep_for(std::chrono::milliseconds(DIAG_POLL_MS));
 
     log_timing_diagnostics();
+    if (flags_.bus_lost.load()) continue;  // the drives do not answer
 
     const uint64_t dump_mask = fault_dump_pending_.exchange(0, std::memory_order_acquire);
     if (dump_mask)

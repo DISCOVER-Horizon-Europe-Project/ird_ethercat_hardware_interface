@@ -65,6 +65,8 @@ void expect_same(const SystemConfig & a, const SystemConfig & b)
   EXPECT_EQ(a.faults.recovery_cooldown_ms, b.faults.recovery_cooldown_ms);
   EXPECT_EQ(a.faults.reset_pulse_ms, b.faults.reset_pulse_ms);
   EXPECT_EQ(a.faults.recovery_budget_refill_ms, b.faults.recovery_budget_refill_ms);
+  EXPECT_EQ(a.faults.bus_loss_timeout_ms, b.faults.bus_loss_timeout_ms);
+  EXPECT_EQ(a.faults.bus_loss_read_error, b.faults.bus_loss_read_error);
 
   ASSERT_EQ(a.drives.size(), b.drives.size());
   for (size_t i = 0; i < a.drives.size(); ++i)
@@ -196,6 +198,9 @@ bus:
   dc_setup_attempts: 5
   dc_sync_tolerance_ns: 2000
   dc_sync_timeout_ms: 3000
+fault_handling:
+  bus_loss_timeout_ms: 0
+  bus_loss_read_error: false
 drive_defaults:
   encoder_ticks_per_rev: 2048
   pdo_limits: {max_bytes: 0, max_entries: 8, max_pdos: 1}
@@ -208,6 +213,8 @@ drives:
   EXPECT_EQ(config.bus.dc_setup_attempts, 5u);
   EXPECT_EQ(config.bus.dc_sync_tolerance_ns, 2000u);
   EXPECT_EQ(config.bus.dc_sync_timeout_ms, 3000u);
+  EXPECT_EQ(config.faults.bus_loss_timeout_ms, 0u);
+  EXPECT_FALSE(config.faults.bus_loss_read_error);
   EXPECT_EQ(config.drives[0].pdo_limits.max_bytes, 0u);
   EXPECT_EQ(config.drives[0].pdo_limits.max_entries, 8u);
   EXPECT_EQ(config.drives[0].pdo_limits.max_pdos, 1u);

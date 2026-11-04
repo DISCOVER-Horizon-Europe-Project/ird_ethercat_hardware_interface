@@ -82,6 +82,9 @@ public:
   hardware_interface::CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state) override;
 
   IRD_ETHERCAT_HARDWARE_INTERFACE_PUBLIC
+  hardware_interface::CallbackReturn on_error(const rclcpp_lifecycle::State & previous_state) override;
+
+  IRD_ETHERCAT_HARDWARE_INTERFACE_PUBLIC
   hardware_interface::return_type read(const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
   IRD_ETHERCAT_HARDWARE_INTERFACE_PUBLIC
@@ -177,6 +180,7 @@ private:
   bool enable_drives();
   void disable_drives_and_leave_op();
   void shutdown_ethercat();
+  void close_lost_bus();
   std::vector<int> slave_positions() const;
 
   // --- Process data ---

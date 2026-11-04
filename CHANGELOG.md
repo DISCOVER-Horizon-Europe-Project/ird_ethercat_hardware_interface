@@ -2,7 +2,9 @@
 
 ## 0.2.0 (unreleased, branch `develop`)
 
-Not yet validated on hardware.
+Tested on the Naviwall robot (three IRD drives, 2026-11-03 and 04): about 1 h of joystick
+driving with position, current and voltage mapped over three TxPDOs, 20 start/stop cycles, and an
+e-stop that cuts the drives' power.
 
 - **Configuration file.** Everything is configured from one YAML file named by the URDF parameter
   `config_file`: bus, fault handling, and per drive the joint, units, limits, PDO mapping,
@@ -39,6 +41,14 @@ Field fixes from the Naviwall robot's driver (2026-10-20 to 2026-10-27), not in 
   the last CPU, as before).
 - **Diagnostics:** the timing dump shows the send time and the CPU of each cycle, and each drive's
   DC sync difference is logged periodically and with every fault.
+
+Found in the robot tests of 0.2.0:
+- **Loss of contact with the drives is detected.** An e-stop that cuts the drives' power went
+  unnoticed (in 0.1.0 and in the robot's driver): no frame came back, the last statuswords still
+  read *Operation Enabled*, and the joint states froze (or drifted, with the integrated position).
+  Now, after `bus_loss_timeout_ms` (100 ms) without a complete frame, the interface logs an
+  error, stops the drives, stops updating the joint states and returns ERROR from `read()`
+  (`bus_loss_read_error`), and closes the bus without waiting for the drives on shutdown.
 
 The default PDO mapping and the cyclic behaviour in CSV mode are unchanged from 0.1.0.
 

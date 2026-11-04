@@ -21,6 +21,7 @@ CyclicController::CyclicController(
   cooldown_cycles_(ms_to_cycles(faults.recovery_cooldown_ms, cycle_time_us)),
   reset_pulse_limit_(ms_to_cycles(faults.reset_pulse_ms, cycle_time_us)),
   refill_cycles_(ms_to_cycles(faults.recovery_budget_refill_ms, cycle_time_us)),
+  bus_loss_cycles_(faults.bus_loss_timeout_ms == 0 ? 0 : ms_to_cycles(faults.bus_loss_timeout_ms, cycle_time_us)),
   motion_(std::move(drives))
 {
   reset();
@@ -39,6 +40,7 @@ void CyclicController::reset()
   cooldown_ = 0;
   reset_pulse_cycles_ = 0;
   healthy_cycles_ = 0;
+  incomplete_frames_ = 0;
 }
 
 CycleFlags CyclicController::begin_cycle(const SharedFlags & shared)
@@ -149,10 +151,34 @@ void CyclicController::stage(
 }
 
 CycleEvents CyclicController::evaluate(
-    const CycleFlags & flags, const std::vector<uint16_t> & statuswords, SharedFlags & shared)
+    const CycleFlags & flags, const std::vector<uint16_t> & statuswords, bool frame_complete, SharedFlags & shared)
 {
   CycleEvents events;
   const size_t n = fault_cycles_.size();
+
+  // ---- Contact with the drives ----
+  // Only while enabling or in operation: before that (SAFE-OP) and while
+  // stopping, the frames are legitimately incomplete. When the drives lose
+  // power (e-stop) no frame comes back at all, and the last statuswords
+  // still read Operation Enabled, so the fault detection below never fires.
+  // The drives come back in INIT and need the full start-up again, hence no
+  // automatic recovery: the drives stay stopped until the next activation.
+  if (flags.enable_request || flags.operation_enabled)
+  {
+    incomplete_frames_ = frame_complete ? 0 : incomplete_frames_ + 1;
+    if (bus_loss_cycles_ > 0 && incomplete_frames_ >= bus_loss_cycles_)
+    {
+      shared.bus_lost.store(true);
+      shared.force_zero.store(true);
+      shared.enable_request.store(false);
+      shared.operation_enabled.store(false);
+      in_recovery_ = false;
+      recovery_pulse_ = false;
+      events.bus_lost = true;
+      return events;
+    }
+    if (!frame_complete) return events;  // stale statuswords: nothing to evaluate
+  }
 
   bool any_fault = false;
   uint64_t fault_mask = 0;

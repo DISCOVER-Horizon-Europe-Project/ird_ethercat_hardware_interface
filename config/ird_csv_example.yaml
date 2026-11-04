@@ -120,6 +120,21 @@ fault_handling:
   reset_pulse_ms: 200
   recovery_budget_refill_ms: 30000
 
+  # Loss of contact with the drives: when no frame comes back with every
+  # drive's data for bus_loss_timeout_ms (drive power cut by an e-stop,
+  # EtherCAT cable unplugged), the interface logs an error and stops the
+  # drives. There is no automatic recovery: drives that lost power restart in
+  # INIT and need the full start-up again, so restart the hardware interface
+  # (or the ros2_control node) once they are powered. 0 = never detect.
+  # With bus_loss_read_error, read() then returns ERROR: ros2_control stops
+  # the controllers that command these joints and the hardware interface goes
+  # to the unconfigured state (a joint_state_broadcaster keeps running on
+  # Humble and publishes the last positions with zero velocities). With
+  # false, read() keeps returning OK: the positions stay at their last value
+  # and the velocities read 0.
+  bus_loss_timeout_ms: 100
+  bus_loss_read_error: true
+
 
 # -----------------------------------------------------------------------------
 # Settings shared by all drives

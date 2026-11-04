@@ -227,6 +227,26 @@ reset pulse (≤ reset_pulse_ms)           controlword 0x0080 to the faulted dri
 - The controllers keep running during a recovery; their commands are ignored until the drives
   are back, and a warning in `write()` says so.
 
+**Loss of contact with the drives.** When an e-stop cuts the drives' power (or a cable is
+unplugged), no frame comes back at all. The last received statuswords still read *Operation
+Enabled*, so the fault detection above sees nothing. Instead, every cycle checks the frame's
+working counter: if no frame carries every drive's data for `bus_loss_timeout_ms` while the drives
+are being enabled or in operation, the interface
+
+- logs `Lost contact with the drives: ...` once, with the timing of the last 128 cycles,
+- stops the drives (controlword 0x0000, zero reference) and does not try to recover: drives that
+  lost power restart in INIT and need the full startup,
+- stops updating the joint states (positions keep their last value, velocities read 0) and,
+  with `bus_loss_read_error`, returns ERROR from `read()`. ros2_control then stops the
+  controllers that command these joints and calls `on_error`, which returns at once (it runs in
+  the control loop shared with other hardware); the interface goes to *unconfigured*. On Humble
+  (2.54, tested) a `joint_state_broadcaster` keeps running, with the last positions and zero
+  velocities, so other hardware in the same controller manager keeps publishing its states.
+
+Restart the hardware interface, or the ros2_control node, once the drives are powered again.
+Shorter gaps (a few lost frames) are tolerated, and the statuswords of incomplete frames are not
+evaluated.
+
 ## 8. Stopping
 
 On deactivation or shutdown (for example Ctrl+C on the launch), the order matters:
@@ -238,6 +258,9 @@ On deactivation or shutdown (for example Ctrl+C on the launch), the order matter
 
 If the frames stopped while the drives were still in OPERATIONAL, the drives would latch error
 49/50, and the next startup would begin with a fault to clear.
+
+After a loss of contact with the drives, steps 1 and 2 are skipped (the drives would not answer):
+the process-data thread is stopped and the bus closed at once.
 
 ## 9. Diagnostics in the log
 

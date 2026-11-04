@@ -221,7 +221,8 @@ void read_fault_handling(Reader & r, const YAML::Node & node, FaultHandlingConfi
   r.check_keys(
       node, where,
       {"enable_timeout_ms", "enable_stable_ms", "enable_fault_abort_ms", "max_recovery_attempts",
-       "recovery_cooldown_ms", "reset_pulse_ms", "recovery_budget_refill_ms"});
+       "recovery_cooldown_ms", "reset_pulse_ms", "recovery_budget_refill_ms", "bus_loss_timeout_ms",
+       "bus_loss_read_error"});
   r.integer(node, "enable_timeout_ms", where, faults.enable_timeout_ms);
   r.integer(node, "enable_stable_ms", where, faults.enable_stable_ms);
   r.integer(node, "enable_fault_abort_ms", where, faults.enable_fault_abort_ms);
@@ -229,6 +230,8 @@ void read_fault_handling(Reader & r, const YAML::Node & node, FaultHandlingConfi
   r.integer(node, "recovery_cooldown_ms", where, faults.recovery_cooldown_ms);
   r.integer(node, "reset_pulse_ms", where, faults.reset_pulse_ms);
   r.integer(node, "recovery_budget_refill_ms", where, faults.recovery_budget_refill_ms);
+  r.integer(node, "bus_loss_timeout_ms", where, faults.bus_loss_timeout_ms);
+  r.boolean(node, "bus_loss_read_error", where, faults.bus_loss_read_error);
 }
 
 void read_pdo(Reader & r, const YAML::Node & node, const std::string & where, uint16_t & index, std::vector<PdoEntry> & entries)
