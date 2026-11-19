@@ -7,7 +7,9 @@ and what to do.
 **How to read a failed start.** Look for the **first** `ERROR` or `FATAL` line from
 `IrdEthercatSystem`: that is the cause. When the hardware cannot start, Humble's controller
 manager exits with `terminate called after throwing an instance of 'std::runtime_error'`. That
-line is only a consequence.
+line is only a consequence. So is the last line from the interface, `Hardware interface stopped
+after losing contact with the drives. ...`: ros2_control reports every failed start through the
+same error callback as a lost bus, so the line appears even when the bus was never lost.
 
 **Contents**
 
@@ -179,7 +181,7 @@ soft_sync` tolerates more jitter (with looser synchronisation).
 | `Drive 'x' (slave N) ESC error counters: ...` | Logged when a drive's EtherCAT error counters change (see above). A single change after power-on is normal; steadily increasing values are not. |
 | `DC sync difference to the reference clock: ...` | Each drive's clock difference to the reference drive. Logged once as a baseline (info), with every fault, and as a warning whenever a drive is more than 1 µs off. A drive that stays off by microseconds or more loses synchronisation: expect error 50 on it. |
 | `Lost contact with the drives: no complete frame for N ms (working counter A, expected B). ...` | No frame came back with every drive's data (A = 0 or -1: none at all). Expected after an e-stop that cuts the drives' power; otherwise check the drives' power and the EtherCAT cables. The drives stay stopped: restart the interface (or the ros2_control node) once they are powered. |
-| `Hardware interface stopped after losing contact with the drives. ...` | Follows the message above when `bus_loss_read_error` is true: ros2_control has stopped the controllers commanding these joints. |
+| `Hardware interface stopped after losing contact with the drives. ...` | Follows the message above when `bus_loss_read_error` is true: ros2_control has stopped the controllers commanding these joints. It is also printed at the end of any failed start (e.g. after `No EtherCAT slaves found`); there, the first error is the cause. |
 | `Not all drives confirmed SAFE-OP before stopping the process data.` | Warning at shutdown: a drive did not confirm SAFE-OP in time. It may report error 49/50 at the next start, which is then cleared automatically. |
 
 ## 9. Reference tables

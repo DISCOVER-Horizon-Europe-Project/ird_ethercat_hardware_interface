@@ -133,8 +133,8 @@ only allowed in `drives`.
 | `rated_torque_nm` | `0` | Motor rated torque in Nm (the drive's 0x6076 is in mNm). Required when torque is commanded or read. |
 | `max_motor_rpm` | `4910` | Motor speed limit. `csv`: faster commands are clamped (with a warning). `csp`: the position reference never moves faster. |
 | `enable_ramp_motor_rad_s2` | `70` | `csv` only. After (re-)enabling, the velocity reference ramps up at this rate (rad/s² at the motor) until it reaches the command. Slowing down and stopping are never delayed. `0` turns the ramp off. |
-| `expected_vendor_id` | `0` | If not 0, startup fails unless the device at `slave_position` reports this vendor id. |
-| `expected_product_code` | `0` | Same, for the product code. |
+| `expected_vendor_id` | `0` | If not 0, startup fails unless the device at `slave_position` reports this vendor id (IRD: `0x00000082`). |
+| `expected_product_code` | `0` | Same, for the product code (IRD: `0x00000500`). |
 | `rx_pdo` | IRD velocity mapping | Objects sent to the drive every cycle. See [PDO mapping](#pdo-mapping). |
 | `tx_pdo` | IRD velocity mapping | Objects read from the drive every cycle. |
 | `pdo_limits` | IRD: 8 bytes, 4 objects, 4 PDOs | What one mapping object accepts. See [Limits of the drive](#limits-of-the-drive). |
@@ -203,6 +203,13 @@ target for another mode would never be written. The TxPDO must contain `position
 `velocity_actual` (or both), because the joint states are derived from them: without
 `position_actual` the position is integrated from the velocity, and without `velocity_actual`
 the velocity is derived from the position.
+
+**Zero of the joint position.** With `position_actual` mapped, the joint position is the drive's
+actual position. On the IRD (firmware revision 0x22, default settings) it is 0 when the drive is
+powered up: it keeps its value across restarts of the interface, but not across a power cycle of
+the drive (for example an emergency stop that cuts the drive's supply). Without `position_actual`,
+the position is integrated from 0 at every activation. If the application needs an absolute
+angle, the axis must be homed or the drive powered up at a known position.
 
 ### Limits of the drive
 

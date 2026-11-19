@@ -1,10 +1,13 @@
 # Changelog
 
-## 0.2.0 (unreleased, branch `develop`)
+## 0.2.0 (2026-11-19)
 
-Tested on the Naviwall robot (three IRD drives, 2026-11-03 and 04): about 1 h of joystick
-driving with position, current and voltage mapped over three TxPDOs, 20 start/stop cycles, and an
-e-stop that cuts the drives' power.
+Tested on the Naviwall robot (three IRD-eb-48/60 drives, firmware revision 0x22, CSV, ROS 2
+Humble with ros2_control 2.54 on a Jetson Orin with a PREEMPT_RT kernel):
+- 2026-11-03 and 04: about 1 h of joystick driving with position, current and DC-link voltage
+  mapped over three TxPDOs, 20 start/stop cycles, and an e-stop that cuts the drives' power.
+- 2026-11-10 to 19: the robot's normal operation (about 80 starts, including autonomous mapping
+  sessions) with the same configuration.
 
 - **Configuration file.** Everything is configured from one YAML file named by the URDF parameter
   `config_file`: bus, fault handling, and per drive the joint, units, limits, PDO mapping,
@@ -49,6 +52,10 @@ Found in the robot tests of 0.2.0:
   Now, after `bus_loss_timeout_ms` (100 ms) without a complete frame, the interface logs an
   error, stops the drives, stops updating the joint states and returns ERROR from `read()`
   (`bus_loss_read_error`), and closes the bus without waiting for the drives on shutdown.
+
+Documentation updated from the robot tests: reserving the CPU of the process-data thread with
+`isolcpus=` (systemd `CPUAffinity=` can be undone by cgroup cpusets), and the IRD's actual
+position starting at 0 at every drive power-up.
 
 The default PDO mapping and the cyclic behaviour in CSV mode are unchanged from 0.1.0.
 

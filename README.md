@@ -22,11 +22,18 @@ no code changes.
 - **Your registers in ROS:** any object added to the PDO mapping (currents, voltages, position,
   I/O...) becomes a ros2_control state or command interface, published by
   `joint_state_broadcaster` with no extra code.
+- **Long mappings split automatically:** an IRD PDO holds 8 bytes and 4 objects, so a longer
+  mapping is spread over the next mapping objects (0x1A01, 0x1A02, ...) without any extra setting.
 - **Real-time process data:** one frame per cycle (4 ms by default) from a dedicated SCHED_FIFO
-  thread, locked to the drives' distributed clock (IRD HardSync or SoftSync).
+  thread, optionally pinned to a reserved CPU, locked to the drives' distributed clock (IRD
+  HardSync or SoftSync).
+- **Checked startup:** every drive's clock is checked after the clock setup (redone if a frame was
+  lost) and must follow the reference drive before anything is enabled; the OPERATIONAL request
+  is repeated to drives that missed it.
 - **Robust operation:** automatic, bounded recovery from transient fieldbus faults (IRD errors
-  49/50), a smooth restart after a fault, and a clean shutdown that leaves no fault latched in
-  the drives.
+  49/50), a smooth restart after a fault, detection of a lost bus (e.g. an emergency stop that
+  cuts the drives' power) within 100 ms, and a clean shutdown that leaves no fault latched in the
+  drives.
 - **Diagnostics in the log:** fault snapshots read from the drive, per-cycle timing before each
   fault, and the EtherCAT error counters. Every configuration mistake is reported with its line
   number.
@@ -71,7 +78,7 @@ Follow the [getting started guide](docs/getting_started.md) for the full procedu
 | Item | Version / notes |
 |---|---|
 | OS | Ubuntu 22.04; a PREEMPT_RT kernel is strongly recommended |
-| ROS 2 | Humble, with `ros2_control` |
+| ROS 2 | Humble, with `ros2_control` (tested with 2.54) |
 | SOEM | 2.x (tested with v2.0.0); installed, or downloaded automatically by the build |
 | Network | An Ethernet port used only for EtherCAT |
 

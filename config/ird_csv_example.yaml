@@ -173,6 +173,8 @@ drive_defaults:
 
   # Optional identity check at startup (0 = do not check). The startup log
   # lists the vendor id and product code of every drive found on the bus.
+  # The IRD-eb-48/60 reports 'Infranor Xtrapuls', vendor_id 0x00000082,
+  # product_code 0x00000500.
   expected_vendor_id: 0
   expected_product_code: 0
 
