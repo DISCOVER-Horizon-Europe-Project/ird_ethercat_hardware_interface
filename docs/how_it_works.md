@@ -152,8 +152,14 @@ robot a robot-arm driver at priority 99 held it about 2.5 ms between waking and 
 frame reached the drives after SYNC0 (error 50). Pinning the thread to a CPU helps only if that
 CPU is kept for it:
 
-- keep other processes off it, e.g. systemd `CPUAffinity=` in `/etc/systemd/system.conf`
-  (every process started after boot inherits it) or the kernel option `isolcpus=`;
+- keep other processes off it with the kernel options `isolcpus=N irqaffinity=<other CPUs>`
+  (check with `cat /sys/devices/system/cpu/isolated`). systemd `CPUAffinity=` alone is not
+  reliable: when cgroup cpusets are in use (for example with Docker installed), moving a process
+  into its cgroup resets its affinity to all CPUs. On the Naviwall robot that let two SCHED_FIFO
+  88 audio threads (PipeWire) run on the reserved CPU and hold the thread 2–2.6 ms, so all drives
+  faulted with error 50 several times in one session, until `isolcpus=` was set;
+- check for other real-time threads above `rt_priority` (`ps -eLo rtprio,psr,comm | sort -n`) and
+  raise `rt_priority` above them if they may run on the same CPU;
 - keep it out of deep idle states: an idle CPU in a deep C-state takes long to wake. On a Jetson
   Orin the deepest state (5 ms exit latency) made the pinned thread wake 2–7 ms late, until it
   was disabled for that CPU (`/sys/devices/system/cpu/cpuN/cpuidle/stateK/disable`).

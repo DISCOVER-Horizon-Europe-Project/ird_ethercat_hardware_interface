@@ -8,7 +8,7 @@
     distributed clocks), based on the SOEM EtherCAT master. Developed by CDEI-UPC (Centre de Disseny
     d'Equips Industrials, Universitat Politecnica de Catalunya).
   </description>
-  <maintainer email="yerayn2000@gmail.com">Yeray Navarro</maintainer>
+  <maintainer email="zewdie.habtie.sisay@upc.edu">Zewdie Habtie</maintainer>
   <author>CDEI-UPC (Centre de Disseny d'Equips Industrials, Universitat Politecnica de Catalunya)</author>
   <license>GPL-3.0-only</license>
 
