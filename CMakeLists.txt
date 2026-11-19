@@ -16,6 +16,8 @@ find_package(ament_cmake REQUIRED)
 foreach(dependency IN ITEMS ${THIS_PACKAGE_INCLUDE_DEPENDS})
   find_package(${dependency} REQUIRED)
 endforeach()
+find_package(yaml_cpp_vendor REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 # ---------------------------------------------------------------------------
 # SOEM (Simple Open EtherCAT Master), version 2.x
@@ -47,9 +49,29 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Core library: configuration, PDO layout, startup SDO plan and the per-cycle
+# enable/fault-recovery logic. No ROS or SOEM dependency, so it is unit-tested
+# on its own (see test/).
+# ---------------------------------------------------------------------------
+add_library(ird_ethercat_core STATIC
+  src/config.cpp
+  src/config_loader.cpp
+  src/cyclic_controller.cpp
+  src/pdo.cpp
+  src/startup_plan.cpp
+)
+set_target_properties(ird_ethercat_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(ird_ethercat_core PUBLIC cxx_std_17)
+target_include_directories(ird_ethercat_core PUBLIC
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+)
+target_link_libraries(ird_ethercat_core PRIVATE yaml-cpp)
+
+# ---------------------------------------------------------------------------
 # Hardware interface plugin
 # ---------------------------------------------------------------------------
 add_library(${PROJECT_NAME} SHARED
+  src/ethercat_master.cpp
   src/ird_ethercat_system.cpp
 )
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
@@ -57,7 +79,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
 )
-target_link_libraries(${PROJECT_NAME} PRIVATE soem)
+target_link_libraries(${PROJECT_NAME} PRIVATE ird_ethercat_core soem)
 ament_target_dependencies(${PROJECT_NAME} PUBLIC ${THIS_PACKAGE_INCLUDE_DEPENDS})
 target_compile_definitions(${PROJECT_NAME} PRIVATE "IRD_ETHERCAT_HARDWARE_INTERFACE_BUILDING_DLL")
 
@@ -68,7 +90,7 @@ install(
   DESTINATION include/${PROJECT_NAME}
 )
 install(
-  DIRECTORY urdf
+  DIRECTORY config launch urdf
   DESTINATION share/${PROJECT_NAME}
 )
 install(TARGETS ${PROJECT_NAME}
@@ -77,6 +99,25 @@ install(TARGETS ${PROJECT_NAME}
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
+
+# ---------------------------------------------------------------------------
+# Unit tests (no hardware needed): colcon test --packages-select ird_ethercat_hardware_interface
+# ---------------------------------------------------------------------------
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_ird_ethercat_core
+    test/test_config.cpp
+    test/test_config_loader.cpp
+    test/test_pdo.cpp
+    test/test_startup_plan.cpp
+    test/test_cia402.cpp
+    test/test_dc_sync.cpp
+    test/test_cyclic_controller.cpp
+  )
+  target_link_libraries(test_ird_ethercat_core ird_ethercat_core)
+  target_compile_definitions(test_ird_ethercat_core PRIVATE
+    "IRD_CONFIG_DIR=\"${PROJECT_SOURCE_DIR}/config\"")
+endif()
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(${THIS_PACKAGE_INCLUDE_DEPENDS})

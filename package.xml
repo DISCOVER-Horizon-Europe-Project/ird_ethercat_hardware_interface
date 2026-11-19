@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>ird_ethercat_hardware_interface</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>
     ros2_control hardware interface for Infranor IRD servo drives over EtherCAT (CiA 402, cyclic PDO,
     distributed clocks), based on the SOEM EtherCAT master. Developed by CDEI-UPC (Centre de Disseny
@@ -20,6 +20,16 @@
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
+  <depend>yaml_cpp_vendor</depend>
+
+  <!-- Only for the example launch file -->
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>forward_command_controller</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

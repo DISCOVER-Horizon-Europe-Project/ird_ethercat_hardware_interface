@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!--
+  Minimal robot description for a first test: one IRD drive turning one joint.
+  It matches config/minimal_example.yaml (drive "axis1" driving "axis1_joint").
+  Used by launch/example.launch.py.
+-->
+<robot name="ird_example" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:arg name="config_file" default="$(find ird_ethercat_hardware_interface)/config/minimal_example.yaml"/>
+  <xacro:arg name="ethercat_interface" default=""/>
+
+  <link name="base_link"/>
+  <link name="axis1_link"/>
+  <joint name="axis1_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="axis1_link"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+
+  <ros2_control name="ird_drives" type="system">
+    <hardware>
+      <plugin>ird_ethercat_hardware_interface/IrdEthercatSystem</plugin>
+      <param name="config_file">$(arg config_file)</param>
+      <param name="ethercat_interface">$(arg ethercat_interface)</param>
+    </hardware>
+    <joint name="axis1_joint">
+      <command_interface name="velocity"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+  </ros2_control>
+</robot>

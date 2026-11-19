@@ -1,0 +1,14 @@
+# Minimal configuration: one IRD drive in cyclic synchronous velocity mode with
+# every other setting at its default. See ird_csv_example.yaml for all keys.
+
+bus:
+  interface: eno1
+
+drive_defaults:
+  encoder_ticks_per_rev: 2048
+
+drives:
+  - name: axis1
+    joint: axis1_joint
+    slave_position: 1
+    gear_ratio: 10.0

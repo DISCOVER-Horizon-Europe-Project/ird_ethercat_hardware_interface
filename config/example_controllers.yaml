@@ -1,0 +1,16 @@
+# Controllers for launch/example.launch.py (one drive in velocity mode).
+controller_manager:
+  ros__parameters:
+    update_rate: 100  # Hz; independent of the EtherCAT cycle (bus.cycle_time_us)
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    velocity_controller:
+      type: forward_command_controller/ForwardCommandController
+
+velocity_controller:
+  ros__parameters:
+    joints:
+      - axis1_joint
+    interface_name: velocity

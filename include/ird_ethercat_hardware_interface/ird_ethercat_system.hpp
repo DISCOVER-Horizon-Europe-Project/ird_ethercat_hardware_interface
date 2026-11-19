@@ -12,7 +12,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <mutex>
+#include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,13 +28,12 @@
 #include "rclcpp/macros.hpp"
 #include "rclcpp/time.hpp"
 #include "rclcpp_lifecycle/state.hpp"
+#include "ird_ethercat_hardware_interface/config.hpp"
+#include "ird_ethercat_hardware_interface/cyclic_controller.hpp"
+#include "ird_ethercat_hardware_interface/dc_sync.hpp"
+#include "ird_ethercat_hardware_interface/ethercat_master.hpp"
+#include "ird_ethercat_hardware_interface/pdo.hpp"
 #include "ird_ethercat_hardware_interface/visibility_control.h"
-
-// SOEM EtherCAT master library (C API)
-extern "C"
-{
-#include "soem/soem.h"
-}
 
 namespace ird_ethercat_hardware_interface
 {
@@ -44,18 +44,18 @@ namespace ird_ethercat_hardware_interface
 ///  - ros2_control update loop: calls read()/write(). Never touches the bus;
 ///    it only exchanges values with the process-data thread through atomics.
 ///  - Process-data thread (SCHED_FIFO): one EtherCAT frame every cycle,
-///    distributed-clock synchronisation, CiA 402 state machine, fault
-///    detection and bounded automatic fault recovery.
-///  - Diagnostics thread (normal priority): slow mailbox (SDO) reads and log
-///    output requested by the process-data thread, so neither of the other
-///    two loops is ever stalled by them.
-///
-/// This first version still drives exactly three IRD drives (left wheel,
-/// right wheel, turret), configured through URDF <param> tags.
+///    distributed-clock synchronisation, CiA 402 enable sequence, fault
+///    detection and recovery (CyclicController).
+///  - Diagnostics thread (normal priority): slow mailbox (SDO) and register
+///    reads plus the log output requested by the process-data thread, so
+///    neither of the other two loops is ever stalled by them.
 class IrdEthercatSystem : public hardware_interface::SystemInterface
 {
 public:
   RCLCPP_SHARED_PTR_DEFINITIONS(IrdEthercatSystem)
+
+  IrdEthercatSystem();
+  ~IrdEthercatSystem() override;
 
   IRD_ETHERCAT_HARDWARE_INTERFACE_PUBLIC
   hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareInfo & info) override;
@@ -82,166 +82,175 @@ public:
   hardware_interface::CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state) override;
 
   IRD_ETHERCAT_HARDWARE_INTERFACE_PUBLIC
+  hardware_interface::CallbackReturn on_error(const rclcpp_lifecycle::State & previous_state) override;
+
+  IRD_ETHERCAT_HARDWARE_INTERFACE_PUBLIC
   hardware_interface::return_type read(const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
   IRD_ETHERCAT_HARDWARE_INTERFACE_PUBLIC
   hardware_interface::return_type write(const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
 private:
-  /// Values read from the URDF <hardware> <param> tags in on_init().
-  struct Config
-  {
-    std::string left_wheel_name;
-    std::string right_wheel_name;
-    std::string turret_name;
-    double transmission_ratio_wheels = 0.0;  // motor revolutions per joint revolution
-    double transmission_ratio_turret = 0.0;
-    int encoder_ticks_per_rev = 0;           // drive velocity unit: ticks/s at the motor shaft
-    int slave_left_motor = 0;                // EtherCAT slave positions (1 = first on the bus)
-    int slave_right_motor = 0;
-    int slave_turret_motor = 0;
-  };
-
-  /// ros2_control joint values (joint side, i.e. after the gearbox).
-  struct Joint
+  /// A PDO entry exposed to ROS as an extra ros2_control interface
+  /// (<joint>/<name>): a state interface for TxPDO entries, a command
+  /// interface for RxPDO entries.
+  struct ExtraInterface
   {
     std::string name;
-    double cmd = 0.0;  // commanded velocity [rad/s]
-    double pos = 0.0;  // position [rad], integrated from the measured velocity
-    double vel = 0.0;  // measured velocity [rad/s]
+    size_t offset{0};        ///< in the drive's PDO
+    DataType type{DataType::UINT8};
+    double scale{1.0};       ///< ROS value = raw * scale
+    double value{0.0};       ///< the ros2_control interface value
+    std::atomic<int64_t> raw{0};  ///< raw value shared with the RT thread
+  };
+
+  /// Runtime state of one drive.
+  struct Drive
+  {
+    const DriveConfig * cfg{nullptr};  ///< points into config_.drives
+
+    // Process image
+    PdoLayout rx_layout;
+    PdoLayout tx_layout;
+    RoleLocation pdo_controlword;
+    RoleLocation pdo_mode_of_operation;
+    RoleLocation pdo_target;  ///< target position, velocity or torque, depending on the mode
+    RoleLocation pdo_statusword;
+    RoleLocation pdo_position_actual;
+    RoleLocation pdo_velocity_actual;
+    RoleLocation pdo_torque_actual;
+    std::vector<std::unique_ptr<ExtraInterface>> state_extras;    ///< from the TxPDO
+    std::vector<std::unique_ptr<ExtraInterface>> command_extras;  ///< to the RxPDO
+    uint8_t * outputs{nullptr};       ///< this drive's RxPDO in the process image
+    const uint8_t * inputs{nullptr};  ///< this drive's TxPDO in the process image
+
+    // Unit conversion. Drive units at the motor shaft: position in encoder
+    // ticks, velocity in ticks/s, torque in 1/1000 of the rated torque.
+    double ticks_per_rad{0.0};         ///< motor-shaft ticks per radian
+    double max_motor_rad_s{0.0};       ///< velocity limit at the motor shaft
+    double torque_units_per_nm{0.0};   ///< drive torque units per motor-shaft Nm
+
+    // ros2_control values (joint side, after the gearbox)
+    double cmd{0.0};     ///< command: position [rad], velocity [rad/s] or effort [Nm], per mode
+    double pos{0.0};     ///< position [rad]: from position_actual, else integrated velocity
+    double vel{0.0};     ///< velocity [rad/s]: from velocity_actual, else differentiated position
+    double effort{0.0};  ///< effort [Nm] from torque_actual (if mapped)
+
+    // Unwrapped position (the drive's 32-bit position wraps around)
+    int64_t position_ticks{0};
+    int32_t last_position_raw{0};
+
+    // Shared between write()/read() and the process-data thread
+    std::atomic<int32_t> target{0};           ///< reference requested by write() [drive units]
+    std::atomic<int32_t> actual_position{0};  ///< [ticks]
+    std::atomic<int32_t> actual_velocity{0};  ///< [ticks/s]
+    std::atomic<int32_t> actual_torque{0};    ///< [1/1000 rated torque]
+    std::atomic<uint16_t> statusword{0};
   };
 
   /// One process-data cycle as recorded by the RT thread, used to tell a late
   /// master (host) from a late or lost frame (network) when a drive faults.
   struct CycleTiming
   {
-    int32_t wake_late_us{0};  // wake-up after the absolute cycle deadline
-    int32_t exchange_us{0};   // send + receive of the process-data frame
-    int32_t dc_phase_us{0};   // frame's DC time past the cycle boundary; SYNC0 fires DC_SYNC_SHIFT_NS after it
-    int32_t toff_us{0};       // DC PI correction applied to the next period
-    int32_t toff_i_us{0};     // integral part of toff_us
-    int16_t wkc{0};           // working counter of the frame
+    int32_t wake_late_us{0};  ///< wake-up after the absolute cycle deadline
+    int32_t send_us{0};       ///< exchange start until the frame was handed to the kernel (incl. lock wait)
+    int32_t exchange_us{0};   ///< send + receive of the process-data frame
+    int32_t dc_phase_us{0};   ///< frame's DC time past the cycle boundary (SYNC0 is sync0_shift_us later)
+    int32_t toff_us{0};       ///< DC PI correction applied to the next period
+    int32_t toff_i_us{0};     ///< integral part of toff_us
+    int16_t wkc{0};           ///< working counter of the frame
+    int16_t cpu{-1};          ///< CPU the cycle ran on
   };
-  static constexpr size_t TIMING_HISTORY_CYCLES = 128;  // 512 ms at 250 Hz
+  static constexpr size_t TIMING_HISTORY_CYCLES = 128;
 
-  // --- EtherCAT bring-up / tear-down (src: "Bus start-up and shutdown") ---
+  // --- Configuration ---
+  bool load_config();
+  bool load_config_from_urdf_params();
+  bool check_joints();
+  void log_pdo_layout(const Drive & drive) const;
+  void init_joint_states();
+
+  // --- Bus start-up and shutdown ---
   bool init_ethercat();
-  bool configure_slave(int slave);
-  bool wait_for_state(uint16_t state, int64_t timeout_us);
+  void setup_dc_clocks();
+  bool dc_clock_setup_ok(uint32_t attempt);
+  bool wait_for_drive_clocks();
+  bool clear_latched_faults();
+  bool wait_for_dc_lock();
+  bool enable_drives();
   void disable_drives_and_leave_op();
   void shutdown_ethercat();
-  bool enable_slaves_via_pdo();
+  void close_lost_bus();
+  std::vector<int> slave_positions() const;
 
-  // --- Process data (src: "Process data") ---
-  int exchange_processdata();
-  void copy_tx_processdata();
-  void stage_zero_rpdo(uint16_t controlword);
-  void run_startup_processdata_cycles(size_t cycles, uint16_t controlword);
+  // --- Process data ---
+  void write_outputs(Drive & drive, uint16_t controlword, int32_t reference);
+  uint16_t read_inputs(Drive & drive);
+  void stage_outputs(uint16_t controlword_all);
+  void run_startup_cycles(uint32_t cycles);
   void start_processdata_thread();
   void stop_processdata_thread();
   void processdata_loop();
-  void sync_linux_to_dc(int64_t reftime, int64_t cycletime, int64_t * offsettime, int64_t * integral_term = nullptr);
+  void log_cycle_events(const CycleEvents & events);
 
-  // --- Diagnostics (src: "Diagnostics thread") ---
+  // --- Diagnostics ---
   void start_diagnostics_thread();
   void stop_diagnostics_thread();
   void diagnostics_loop();
+  void dump_fault_snapshot(const Drive & drive, bool latched_before_activation = false);
   void log_esc_error_counters(bool force);
+  int64_t dc_sync_differences(std::string & line);
+  void log_dc_sync_differences(bool force);
   void log_timing_diagnostics();
 
-  // --- SDO access with retries ---
-  template<typename T>
-  bool write_sdo(uint16_t slave, uint16_t index, uint8_t subindex, T value);
-
-  // --- Unit conversions (motor shaft) ---
-  int32_t rad_s_to_ticks_s(double rad_s) const;
-  double ticks_s_to_rad_s(int32_t ticks_s) const;
-
-  Config cfg_;
-  Joint wheel_l_;
-  Joint wheel_r_;
-  Joint turret_;
+  SystemConfig config_;
+  std::vector<std::unique_ptr<Drive>> drives_;
 
   rclcpp::Logger logger_{rclcpp::get_logger("IrdEthercatSystem")};
   rclcpp::Clock steady_clock_{RCL_STEADY_TIME};  // for throttled log messages
 
-  // --- SOEM state ---
-  ecx_contextt ec_context_{};       // SOEM master context
-  std::mutex ethercat_bus_mutex_;   // serialises process-data frames and state changes
-  std::string ethercat_interface_{"eno1"};
-  char io_map_[4096]{};             // process image, mapped by SOEM
-  int expected_wkc_{0};
+  std::unique_ptr<EthercatMaster> master_;
   bool ec_initialized_{false};
-
-  // Local copies of each drive's process data (RxPDO = outputs to the drive,
-  // TxPDO = inputs from the drive).
-  std::vector<uint8_t> rx_buffer_left_;
-  std::vector<uint8_t> tx_buffer_left_;
-  std::vector<uint8_t> rx_buffer_right_;
-  std::vector<uint8_t> tx_buffer_right_;
-  std::vector<uint8_t> rx_buffer_turret_;
-  std::vector<uint8_t> tx_buffer_turret_;
-
-  // Each drive's slice of io_map_, as mapped by SOEM.
-  uint8_t * rx_left_{nullptr};
-  uint8_t * tx_left_{nullptr};
-  uint8_t * rx_right_{nullptr};
-  uint8_t * tx_right_{nullptr};
-  uint8_t * rx_turret_{nullptr};
-  uint8_t * tx_turret_{nullptr};
-
-  // --- Shared between write()/read(), lifecycle callbacks and the RT thread ---
-  std::atomic<bool> force_zero_velocity_{false};
-  std::atomic<bool> enable_request_{false};       // lifecycle -> RT: run the CiA 402 enable sequence
-  std::atomic<bool> operation_enabled_{false};    // RT -> lifecycle: all drives Operation Enabled
-  std::atomic<bool> enable_fault_abort_{false};   // RT -> lifecycle: enable sequence gave up
-  std::atomic<int> last_processdata_wkc_{0};
-  std::atomic<int32_t> target_tps_left_{0};       // motor-shaft velocity targets [ticks/s]
-  std::atomic<int32_t> target_tps_right_{0};
-  std::atomic<int32_t> target_tps_turret_{0};
-  std::atomic<int32_t> actual_tps_left_{0};       // motor-shaft measured velocity [ticks/s]
-  std::atomic<int32_t> actual_tps_right_{0};
-  std::atomic<int32_t> actual_tps_turret_{0};
-  std::atomic<uint16_t> statusword_left_{0};
-  std::atomic<uint16_t> statusword_right_{0};
-  std::atomic<uint16_t> statusword_turret_{0};
+  std::optional<DcSync> dc_sync_;              ///< shared by the start-up cycles and the RT loop
+  std::optional<CyclicController> controller_;
+  SharedFlags flags_;
   bool first_write_warned_{false};
-  uint32_t low_wkc_reads_{0};                     // read() calls that saw a short working counter
+  uint32_t low_wkc_reads_{0};  ///< read() calls that saw a short working counter
 
   // --- Process-data thread ---
   std::thread processdata_thread_;
   std::atomic<bool> processdata_thread_stop_{false};
-  std::atomic<bool> processdata_thread_running_{false};
+  std::atomic<int> last_processdata_wkc_{0};
   // DC phase of the last received frame and how many consecutive cycles it
-  // has stayed within DC_LOCK_TOLERANCE_US; on_activate() waits on these
+  // has stayed within the lock tolerance; on_activate() waits on these
   // before requesting OPERATIONAL.
   std::atomic<int32_t> dc_phase_us_{0};
   std::atomic<uint32_t> dc_locked_cycles_{0};
-  // Integral term of the DC PI loop. Shared by the start-up cycles and the RT
-  // loop (so the start-up pull-in carries over), reset in init_ethercat().
-  int64_t dc_integral_{0};
+  // Buffers used by the RT loop, allocated once in on_init()
+  std::vector<int32_t> rt_targets_;
+  std::vector<int32_t> rt_references_;
+  std::vector<int32_t> rt_actual_positions_;
+  std::vector<uint16_t> rt_statuswords_;
+  std::vector<uint16_t> rt_controlwords_;
 
   // --- Diagnostics thread ---
-  // Fault diagnostics are dumped from the diagnostics thread, never from
-  // the RT loop (the SDO mailbox reads take tens of ms and would stall the
-  // cyclic RPDO, cascading a single-drive fault into a bus-wide fieldbus
-  // SYNC error on the remaining drives) and not from read() either (the
-  // three snapshots block ~55 ms, which stalls the whole ros2_control update
-  // and, in a full robot, other hardware such as a robot arm).
-  // Bit mask: bit0 = left, bit1 = right, bit2 = turret.
-  std::atomic<uint8_t> fault_dump_pending_{0};
+  // Fault snapshots are read by SDO from the diagnostics thread, never from
+  // the RT loop (the mailbox reads take tens of ms and would stall the cyclic
+  // RPDO, cascading a single-drive fault into a bus-wide fieldbus SYNC error
+  // on the remaining drives) nor from read() (they would stall the whole
+  // ros2_control update, and with it other hardware such as a robot arm).
+  std::atomic<uint64_t> fault_dump_pending_{0};  ///< bit i = drive i
   std::thread diagnostics_thread_;
   std::atomic<bool> diagnostics_thread_stop_{false};
-  // ESC error counters (registers 0x0300..0x0313) as last logged, indexed by
-  // slave position, to print only on change. Sized in init_ethercat().
+  /// ESC error counters as last logged, per drive, to print only on change.
   std::vector<std::array<uint8_t, 20>> esc_counters_last_;
 
   // Cycle timing ring. The RT loop records every cycle and, on a fault, hands
   // a copy to the diagnostics thread through timing_dump_ready_; only that
   // thread logs it. Nothing is logged while the bus is healthy.
-  std::array<CycleTiming, TIMING_HISTORY_CYCLES> timing_history_{};  // RT thread only
+  std::array<CycleTiming, TIMING_HISTORY_CYCLES> timing_history_{};  ///< RT thread only
   size_t timing_history_next_{0};
-  std::array<CycleTiming, TIMING_HISTORY_CYCLES> timing_dump_{};     // oldest first
+  std::array<CycleTiming, TIMING_HISTORY_CYCLES> timing_dump_{};     ///< oldest first
   std::atomic<bool> timing_dump_ready_{false};
 };
 

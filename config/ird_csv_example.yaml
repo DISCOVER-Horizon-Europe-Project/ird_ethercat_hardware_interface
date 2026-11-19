@@ -1,0 +1,296 @@
+# =============================================================================
+# ird_ethercat_hardware_interface: configuration file
+# =============================================================================
+#
+# This file describes the EtherCAT bus and every Infranor IRD drive on it. It is
+# the only file you need to edit to use the hardware interface with your drives.
+# Point to it from the <hardware> block of your URDF:
+#
+#   <param name="config_file">$(find my_robot)/config/drives.yaml</param>
+#
+# This example contains EVERY available key, set to its default value (the
+# values validated on the Naviwall robot: three IRD-eb-48/60 drives in cyclic
+# synchronous velocity mode, 4 ms cycle, HardSync). Keys you leave out keep
+# their default, so your own file can be much shorter: see minimal_example.yaml.
+#
+# Notation:
+#   - Objects of the drive's object dictionary are written as in the drive
+#     manuals: "0xIIII:SS" = index IIII, subindex SS, both hexadecimal.
+#     Quote them ("0x6040:00"), otherwise YAML reads the colon as a separator.
+#   - Integers can be decimal (4000) or hexadecimal (0x1600).
+#   - Data types: int8, uint8, int16, uint16, int32, uint32.
+#
+# Any mistake (unknown key, wrong type, missing value, inconsistent setting) is
+# reported at startup with the line number, and the interface does not start.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# EtherCAT bus
+# -----------------------------------------------------------------------------
+bus:
+  # Network interface connected to the drives (list them with `ip link`).
+  # The URDF parameter `ethercat_interface`, if given, overrides this value.
+  interface: eno1
+
+  # Process-data cycle: every cycle the interface sends the references to all
+  # drives and reads their feedback. Written to each drive as 0x1006:00.
+  cycle_time_us: 4000
+
+  # Real-time priority (SCHED_FIFO, 1..99) of the thread that runs the cycle.
+  rt_priority: 80
+
+  # CPU the cycle thread is pinned to: -1 = not pinned, -2 = the last CPU, or a
+  # CPU number. Pinning helps only if that CPU is kept free of other real-time
+  # threads and out of deep idle states (see docs/how_it_works.md). The
+  # Naviwall robot uses -2, with CPU 11 reserved for it.
+  rt_cpu: -1
+
+  # Synchronise the drives with EtherCAT distributed clocks (SYNC0). Strongly
+  # recommended: without it the drives are not synchronised to the master.
+  distributed_clocks: true
+
+  # IRD synchronisation mode (0x2012:01), used with distributed clocks:
+  #   hard_sync  (4): the drive is locked to SYNC0. Strict timing: each frame
+  #                   must reach the drives at least 100 us before SYNC0.
+  #   soft_sync  (2): the drive follows SYNC0 loosely. Tolerates more jitter
+  #                   from the master, at the cost of looser synchronisation.
+  sync_mode: hard_sync
+
+  # Time from the master's frame to SYNC0 (when the drives latch the new
+  # references). Infranor's minimum is 100 us and their recommendation 200 us.
+  # Use more if the master's timing is noisy (e.g. EtherCAT shares its network
+  # port with other traffic): 2000 us (mid-cycle) absorbs frames up to ~1.9 ms
+  # late. Must be smaller than cycle_time_us.
+  sync0_shift_us: 2000
+
+  # Before switching the drives to OPERATIONAL, the interface waits until its
+  # frames have stayed within dc_lock_tolerance_us of their target timing for
+  # dc_lock_ms in a row (or dc_lock_timeout_ms, after which it continues with a
+  # warning).
+  dc_lock_tolerance_us: 200
+  dc_lock_ms: 200
+  dc_lock_timeout_ms: 3000
+
+  # Frames exchanged at startup, with all outputs at zero, to let the
+  # distributed-clock synchronisation settle.
+  startup_settle_ms: 1000
+
+  # Checks of the drives' clocks at startup (with distributed clocks):
+  # - Right after the clock setup, every drive's clock must agree with the
+  #   master's within dc_setup_tolerance_us, otherwise the setup is redone (up
+  #   to dc_setup_attempts times). A frame lost during the setup leaves a drive
+  #   seconds off.
+  # - After the settle, every drive's clock must be within dc_sync_tolerance_ns
+  #   of the reference drive (register 0x092C) within dc_sync_timeout_ms,
+  #   otherwise startup fails without enabling any drive. Good starts read a
+  #   few hundred ns at most.
+  dc_setup_tolerance_us: 1000
+  dc_setup_attempts: 3
+  dc_sync_tolerance_ns: 10000
+  dc_sync_timeout_ms: 2000
+
+
+# -----------------------------------------------------------------------------
+# Enabling the drives and recovering from faults
+# -----------------------------------------------------------------------------
+fault_handling:
+  # Activation fails if not every drive reaches Operation Enabled in time.
+  enable_timeout_ms: 5000
+
+  # All drives must stay in Operation Enabled this long before the interface
+  # starts sending the controllers' references.
+  enable_stable_ms: 40
+
+  # During activation, a drive that stays in FAULT this long aborts it.
+  enable_fault_abort_ms: 100
+
+  # While running, if any drive faults, all drives are stopped (zero reference)
+  # and the interface tries to recover automatically:
+  #   1. wait recovery_cooldown_ms,
+  #   2. send a fault reset (controlword 0x0080) for at most reset_pulse_ms,
+  #   3. run the enable sequence again and ramp the references back up.
+  # Transient communication faults (IRD errors 49/50) clear this way. A fault
+  # that does not clear uses up the attempts and the drives stay disabled until
+  # the interface is restarted. The attempts are counted per incident: after
+  # recovery_budget_refill_ms without faults, the count starts again from zero.
+  # Set max_recovery_attempts to 0 to never recover automatically.
+  max_recovery_attempts: 5
+  recovery_cooldown_ms: 500
+  reset_pulse_ms: 200
+  recovery_budget_refill_ms: 30000
+
+  # Loss of contact with the drives: when no frame comes back with every
+  # drive's data for bus_loss_timeout_ms (drive power cut by an e-stop,
+  # EtherCAT cable unplugged), the interface logs an error and stops the
+  # drives. There is no automatic recovery: drives that lost power restart in
+  # INIT and need the full start-up again, so restart the hardware interface
+  # (or the ros2_control node) once they are powered. 0 = never detect.
+  # With bus_loss_read_error, read() then returns ERROR: ros2_control stops
+  # the controllers that command these joints and the hardware interface goes
+  # to the unconfigured state (a joint_state_broadcaster keeps running on
+  # Humble and publishes the last positions with zero velocities). With
+  # false, read() keeps returning OK: the positions stay at their last value
+  # and the velocities read 0.
+  bus_loss_timeout_ms: 100
+  bus_loss_read_error: true
+
+
+# -----------------------------------------------------------------------------
+# Settings shared by all drives
+# -----------------------------------------------------------------------------
+# Every drive in the `drives` list below starts from these values; a drive can
+# override any of them. Lists (PDO entries, SDOs) are replaced as a whole.
+drive_defaults:
+  # CiA 402 mode of operation (0x6060), and the joint command it takes:
+  #   csv  cyclic synchronous velocity  -> joint command interface `velocity` [rad/s]
+  #   csp  cyclic synchronous position  -> joint command interface `position` [rad]
+  #   cst  cyclic synchronous torque    -> joint command interface `effort`   [Nm]
+  # Only csv has been validated on hardware so far. See other_modes_example.yaml
+  # for the PDO mapping that csp and cst need.
+  mode: csv
+
+  # Units. The drive works at the motor shaft: position in encoder ticks,
+  # velocity in ticks per second, torque in 1/1000 of the motor rated torque.
+  # The ros2_control joint is after a gearbox of gear_ratio motor revolutions
+  # per joint revolution; joint values are in rad, rad/s and Nm at the joint.
+  encoder_ticks_per_rev: 2048
+  gear_ratio: 1.0
+  # Motor rated torque in Nm (the drive's 0x6076, which is in mNm). Only needed
+  # when torque is commanded (target_torque) or read (torque_actual).
+  rated_torque_nm: 0.0
+
+  # Motor speed limit. csv: commands above it are clamped (with a warning).
+  # csp: the position reference never moves faster than this.
+  max_motor_rpm: 4910
+
+  # csv only: after the drives are (re-)enabled, the velocity reference ramps
+  # up at this rate (motor shaft) until it matches the command, so a controller
+  # still holding an old command cannot cause a jump. Slowing down and stopping
+  # are always applied immediately. 0 disables the ramp. (In csp the reference
+  # always starts from the actual position, so enabling never moves the axis.)
+  enable_ramp_motor_rad_s2: 70
+
+  # Optional identity check at startup (0 = do not check). The startup log
+  # lists the vendor id and product code of every drive found on the bus.
+  expected_vendor_id: 0
+  expected_product_code: 0
+
+  # PDO mapping: the objects exchanged with the drive every cycle, written to
+  # the drive at startup. Choose them from the drive's object dictionary (the
+  # object must be marked "PDO mapping: yes/possible"). Sizes and positions in
+  # the frame are computed automatically and logged at startup.
+  #
+  # Each entry has an `object`, a `type`, and at least one of:
+  #
+  #   role       what the interface itself uses the object for:
+  #                RxPDO (master -> drive)
+  #                  controlword        0x6040 uint16  always required
+  #                  mode_of_operation  0x6060 int8    optional (written every cycle)
+  #                  target_velocity    0x60FF int32   required in csv
+  #                  target_position    0x607A int32   required in csp
+  #                  target_torque      0x6071 int16   required in cst
+  #                TxPDO (drive -> master)
+  #                  statusword         0x6041 uint16  always required
+  #                  mode_display       0x6061 int8    optional
+  #                  velocity_actual    0x606C int32   required in csv; gives the joint velocity
+  #                  position_actual    0x6064 int32   required in csp; gives the joint position
+  #                  torque_actual      0x6077 int16   optional; gives the joint effort
+  #              Without position_actual the joint position is integrated from
+  #              the velocity; without velocity_actual the joint velocity is
+  #              derived from the position. One of the two must be mapped.
+  #
+  #   interface  expose the raw object to ROS as the ros2_control interface
+  #              <joint>/<interface>, multiplied by `scale` (default 1):
+  #                TxPDO entries become state interfaces (read): they are
+  #                  published by joint_state_broadcaster on /dynamic_joint_states.
+  #                RxPDO entries become command interfaces (write), e.g. with a
+  #                  forward_command_controller. Only for entries without a role
+  #                  (the interface itself writes those).
+  #              They do not need to be declared in the URDF.
+  #
+  # Example: also read the position, the motor current and the DC-link voltage
+  # (CiA 402 objects: 0x6078 in 1/1000 of the motor rated current, 0x6079 in
+  # mV; check them in the drive manual for `scale`):
+  #   tx_pdo:
+  #     index: 0x1A00
+  #     entries:
+  #       - {object: "0x6041:00", type: uint16, role: statusword}
+  #       - {object: "0x6061:00", type: int8,   role: mode_display}
+  #       - {object: "0x606C:00", type: int32,  role: velocity_actual}
+  #       - {object: "0x6064:00", type: int32,  role: position_actual}
+  #       - {object: "0x6078:00", type: int16,  interface: current_actual, scale: 0.001}
+  #       - {object: "0x6079:00", type: uint32, interface: dc_link_voltage, scale: 0.001}
+  #
+  # `index` is the first mapping object. One IRD PDO holds at most 4 objects
+  # and 8 bytes, so a longer list is split over the next mapping objects
+  # (0x1A01, 0x1A02, ...) automatically: the example above uses 0x1A00 (7
+  # bytes), 0x1A01 (position and current) and 0x1A02 (voltage). The startup
+  # log shows the split. If the drive still rejects a mapping (e.g. an object
+  # that cannot be mapped), startup fails and the log shows the SDO abort code
+  # (0x06040041: not mappable, 0x06040042: too long, 0x06090011: too many).
+  rx_pdo:
+    index: 0x1600
+    entries:
+      - {object: "0x6040:00", type: uint16, role: controlword}
+      - {object: "0x6060:00", type: int8, role: mode_of_operation}
+      - {object: "0x60FF:00", type: int32, role: target_velocity}
+  tx_pdo:
+    index: 0x1A00
+    entries:
+      - {object: "0x6041:00", type: uint16, role: statusword}
+      - {object: "0x6061:00", type: int8, role: mode_display}
+      - {object: "0x606C:00", type: int32, role: velocity_actual}
+
+  # What one PDO mapping object of the drive accepts (0 = no limit), used to
+  # split the entries above. The IRD (firmware revision 0x22) takes 8 bytes and
+  # 4 objects per PDO, and 4 PDOs per direction (0x1600-0x1603, 0x1A00-0x1A03).
+  pdo_limits:
+    max_bytes: 8
+    max_entries: 4
+    max_pdos: 4
+
+  # Extra objects written by SDO at startup (in PRE-OP), before the PDO
+  # mapping, in the order listed. If a write fails, startup fails, unless the
+  # entry has `required: false`. Example:
+  #   startup_sdos:
+  #     - {object: "0x6083:00", type: uint32, value: 100000}
+  startup_sdos: []
+
+  # Objects read and logged when a drive faults, to help diagnose the cause.
+  fault_snapshot:
+    - {object: "0x603F:00", type: uint16, name: error_code}
+    - {object: "0x1001:00", type: uint8, name: error_register}
+    - {object: "0x3022:01", type: uint32, name: error_bits_1}
+    - {object: "0x3022:02", type: uint32, name: error_bits_2}
+    - {object: "0x3024:00", type: uint32, name: warning_code}
+
+
+# -----------------------------------------------------------------------------
+# Drives
+# -----------------------------------------------------------------------------
+# One entry per drive. Required for each:
+#   name            used in log messages
+#   joint           ros2_control joint driven by this drive. It must be declared
+#                   in the <ros2_control> block of the URDF with the command
+#                   interface of its mode (velocity / position / effort). Its
+#                   state interfaces can be position, velocity, effort (if
+#                   torque_actual is mapped) and any exposed TxPDO entry.
+#   slave_position  position on the EtherCAT bus: 1 = first drive after the
+#                   master, 2 = the next one, ...
+# Any key of drive_defaults can be added to override it for this drive.
+drives:
+  - name: left
+    joint: drivewhl_l_joint
+    slave_position: 1
+    gear_ratio: 20.0
+
+  - name: right
+    joint: drivewhl_r_joint
+    slave_position: 2
+    gear_ratio: 20.0
+
+  - name: turret
+    joint: turret_joint
+    slave_position: 3
+    gear_ratio: 51.67

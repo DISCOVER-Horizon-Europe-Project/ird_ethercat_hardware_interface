@@ -1,0 +1,64 @@
+# Example: one drive in cyclic synchronous POSITION mode (csp) and one in
+# cyclic synchronous TORQUE mode (cst), with the PDO mapping each mode needs.
+# Every key is explained in ird_csv_example.yaml.
+#
+# NOTE: csp and cst are implemented but have NOT yet been validated on
+# hardware (the Naviwall robot runs csv). Test them on a free-standing axis
+# first, with conservative limits on the drive itself (e.g. 0x6072 max torque,
+# 0x607F max profile velocity, software position limits) set through
+# startup_sdos or the drive's own configuration.
+
+bus:
+  interface: eno1
+
+drive_defaults:
+  encoder_ticks_per_rev: 2048
+
+drives:
+  # ---- Position mode ----
+  # The joint takes a `position` command [rad]. The reference starts from the
+  # drive's actual position (enabling never moves the axis) and never moves
+  # faster than max_motor_rpm. The joint position is the drive's own
+  # position_actual (0x6064), i.e. relative to the drive's home position.
+  - name: lift
+    joint: lift_joint
+    slave_position: 1
+    mode: csp
+    gear_ratio: 10.0
+    max_motor_rpm: 1000
+    rx_pdo:
+      index: 0x1600
+      entries:
+        - {object: "0x6040:00", type: uint16, role: controlword}
+        - {object: "0x6060:00", type: int8, role: mode_of_operation}
+        - {object: "0x607A:00", type: int32, role: target_position}
+    tx_pdo:
+      index: 0x1A00
+      entries:
+        - {object: "0x6041:00", type: uint16, role: statusword}
+        - {object: "0x6064:00", type: int32, role: position_actual}
+        - {object: "0x606C:00", type: int32, role: velocity_actual}
+
+  # ---- Torque mode ----
+  # The joint takes an `effort` command [Nm at the joint]. It is converted to
+  # the drive's unit (1/1000 of the motor rated torque) with gear_ratio and
+  # rated_torque_nm. Zero torque is sent whenever the drive is not enabled.
+  - name: gripper
+    joint: gripper_joint
+    slave_position: 2
+    mode: cst
+    gear_ratio: 5.0
+    rated_torque_nm: 0.64
+    rx_pdo:
+      index: 0x1600
+      entries:
+        - {object: "0x6040:00", type: uint16, role: controlword}
+        - {object: "0x6060:00", type: int8, role: mode_of_operation}
+        - {object: "0x6071:00", type: int16, role: target_torque}
+    tx_pdo:
+      index: 0x1A00
+      entries:
+        - {object: "0x6041:00", type: uint16, role: statusword}
+        - {object: "0x6064:00", type: int32, role: position_actual}
+        - {object: "0x606C:00", type: int32, role: velocity_actual}
+        - {object: "0x6077:00", type: int16, role: torque_actual}
